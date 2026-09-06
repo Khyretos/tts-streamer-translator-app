@@ -1,6 +1,5 @@
 import argparse
 import gc
-import io
 import json
 import os
 import queue
@@ -8,7 +7,6 @@ import re
 import secrets
 import threading
 import time
-import wave
 from pathlib import Path
 
 import gradio as gr
@@ -22,151 +20,43 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from vosk import KaldiRecognizer, Model
 
 from logger import Logger
+import translators as tmod
 from translators import TranslationService
 
-# ── Environment setup ────────────────────────────────────────────────────────
-os.environ["ARGOS_PACKAGES_DIR"] = os.getcwd() + "/argos_models"
+# ── Recognizer / translation backends (see recognizers.py) ───────────────────
+from recognizers import (
+    ARGOS_AVAILABLE,
+    MOONSHINE_LANGUAGES,
+    ArgosTranslator,
+    MoonshineRecognizer,
+    WhisperRecognizer,
+    _MOONSHINE_AVAILABLE,
+    dots_or_stars,
+    is_whisper_hallucination,
+)
+from vad import FastVAD, _WRTCVAD_AVAILABLE
+from subtitles import SubtitleManager
+from session import SessionSlugMiddleware, get_slug
+from settings_store import SETTINGS_DIR, load_saved_settings, persist_settings
 
-# ── Optional imports ──────────────────────────────────────────────────────────
-try:
-    import argostranslate.package
+if ARGOS_AVAILABLE:
+    # Needed directly (not just via ArgosTranslator) for the Argos settings
+    # panel in create_ui(), which lists installed language pairs.
     import argostranslate.translate
 
-    ARGOS_AVAILABLE = True
-except ImportError:
-    ARGOS_AVAILABLE = False
-    print("[WARNING] argostranslate not installed. Offline translation disabled.")
 
 # ── Session storage ───────────────────────────────────────────────────────────
+# Keyed by *slug* (a persistent identity — see SessionSlugMiddleware below),
+# not by Gradio's ephemeral per-page-load session_hash. This is what lets a
+# tab reload / reconnect / a second tab re-attach to the same running
+# session instead of spawning a brand new one.
 SESSION_APPS: dict = {}
 SESSION_LOCK = threading.Lock()
 
-# ── Settings persistence ──────────────────────────────────────────────────────
-SETTINGS_FILE = Path("settings.json")
-
-# Keys that are safe to persist between sessions
-PERSISTABLE_KEYS = [
-    "audio_mode",
-    "recognition_engine",
-    "vosk_model",
-    "enable_translation",
-    "display_interim",
-    "translation_mode",
-    "source_language",
-    "target_language",
-    "font_family",
-    "custom_font",
-    "recognized_font_size",
-    "translated_font_size",
-    "recognized_color",
-    "translated_color",
-    "background_color",
-    "text_alignment",
-    "translation_position",
-    "whisper_host",
-    "whisper_api_key",
-    "whisper_model",
-    "whisper_language",
-    "whisper_temperature",
-    "whisper_best_of",
-    "whisper_beam_size",
-    "whisper_patience",
-    "whisper_length_penalty",
-    "whisper_suppress_tokens",
-    "whisper_initial_prompt",
-    "whisper_condition_on_previous_text",
-    "whisper_temperature_increment_on_fallback",
-    "whisper_no_speech_threshold",
-    "whisper_logprob_threshold",
-    "whisper_compression_ratio_threshold",
-    "whisper_translate_host",
-    "whisper_translate_api_key",
-    "whisper_translate_model",
-    "whisper_translate_temperature",
-    "whisper_translate_best_of",
-    "whisper_translate_beam_size",
-    "whisper_translate_patience",
-    "whisper_translate_length_penalty",
-    "whisper_translate_suppress_tokens",
-    "whisper_translate_initial_prompt",
-    "whisper_translate_condition_on_previous_text",
-    "whisper_translate_temperature_increment_on_fallback",
-    "whisper_translate_no_speech_threshold",
-    "whisper_translate_logprob_threshold",
-    "whisper_translate_compression_ratio_threshold",
-    "argos_source_lang",
-    "argos_target_lang",
-    "libretranslate_host",
-    "libretranslate_api_key",
-    "fade_timeout",
-    "ai_host",
-    "ai_api_key",
-    "ai_model",
-    "outline_width",
-    "outline_color",
-    "translated_outline_width",
-    "translated_outline_color",
-    "vad_threshold",
-    "vad_end_silence_ms",
-    "subtitle_mode",
-    "subtitle_cps",
-    "subtitle_max_lines",
-    "moonshine_language",
-    "moonshine_cache_dir",
-    "noise_filter_threshold",
-]
-
-_settings_save_timer: threading.Timer | None = None
-_settings_save_lock = threading.Lock()
-
-
-def load_saved_settings() -> dict:
-    """Load persisted settings from disk. Returns empty dict on failure."""
-    try:
-        if SETTINGS_FILE.exists():
-            with open(SETTINGS_FILE, "r") as f:
-                data = json.load(f)
-                # Migrate old 0–1 vad_threshold values to dB if present
-                if "vad_threshold" in data:
-                    v = data["vad_threshold"]
-                    if isinstance(v, (int, float)) and v > 0:
-                        import math
-
-                        rms = 0.001 + (float(v) ** 1.5) * 0.499
-                        data["vad_threshold"] = round(
-                            max(-60.0, min(0.0, 20.0 * math.log10(max(rms, 1e-9)))), 1
-                        )
-                        print(
-                            f"[SETTINGS] Migrated vad_threshold {v} → {data['vad_threshold']} dB"
-                        )
-                print(f"[SETTINGS] Loaded saved settings from {SETTINGS_FILE}")
-                return data
-    except Exception as e:
-        print(f"[WARNING] Could not load settings: {e}")
-    return {}
-
-
-def persist_settings(settings: dict):
-    """Debounced save of persistable settings to disk (1 s delay)."""
-    global _settings_save_timer
-    with _settings_save_lock:
-        if _settings_save_timer is not None:
-            _settings_save_timer.cancel()
-        snapshot = {k: settings[k] for k in PERSISTABLE_KEYS if k in settings}
-        timer = threading.Timer(1.0, _write_settings, args=[snapshot])
-        timer.daemon = True
-        timer.start()
-        _settings_save_timer = timer
-
-
-def _write_settings(data: dict):
-    """Actually write settings to disk (called from timer thread)."""
-    try:
-        with open(SETTINGS_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f"[WARNING] Could not save settings: {e}")
-
+# Session slug resolution (SessionSlugMiddleware, get_slug, sanitize_slug)
+# and per-slug settings persistence (load_saved_settings, persist_settings,
+# PERSISTABLE_KEYS, SETTINGS_DIR) now live in session.py / settings_store.py
+# — imported above. See SESSIONS.md.
 
 # ── Font helpers ──────────────────────────────────────────────────────────────
 def get_available_fonts():
@@ -306,20 +196,32 @@ window.stopHwLevelPolling = function() {
     updateVolumeMeter(0);
 };
 
+// ── Audio source detection ─────────────────────────────────────────────────
+// Mirrors whichever "Audio Source" radio option is currently checked.
+window.__getAudioSourceType = function() {
+    var micRadio = document.querySelector('input[value="browser_mic"]');
+    var dispRadio = document.querySelector('input[value="browser_display"]');
+    if (dispRadio && dispRadio.checked) return 'display';
+    if (micRadio && micRadio.checked) return 'mic';
+    return 'mic';
+};
+
 // ── Browser streaming (full: recognition + meter) ─────────────────────────
 window.startBrowserStreaming = function() {
-    var browserRadio = document.querySelector('input[value="browser"]');
-    if (!browserRadio || !browserRadio.checked) return;
+    var micRadio = document.querySelector('input[value="browser_mic"]');
+    var dispRadio = document.querySelector('input[value="browser_display"]');
+    var isBrowserMode = (micRadio && micRadio.checked) || (dispRadio && dispRadio.checked);
+    if (!isBrowserMode) return;
     if (window.__audioStreamActive) return;
     window.__audioStreamActive = true;
-    window.__startAudioCapture(true);
+    window.__startAudioCapture(true, window.__getAudioSourceType());
 };
 
 // ── Browser mic test (meter only, no WebSocket) ───────────────────────────
 window.startBrowserMicTest = function() {
     if (window.__audioStreamActive || window.__micTestActive) return;
     window.__micTestActive = true;
-    window.__startAudioCapture(false);
+    window.__startAudioCapture(false, window.__getAudioSourceType());
 };
 
 window.stopBrowserMicTest = function() {
@@ -329,11 +231,32 @@ window.stopBrowserMicTest = function() {
 };
 
 // ── Core audio capture (shared) ───────────────────────────────────────────
-window.__startAudioCapture = function(withWs) {
+// sourceType: 'mic' (getUserMedia, this device's microphone) or 'display'
+// (getDisplayMedia — a shared browser tab/window/screen, with its audio —
+// e.g. a Discord web tab, or on Windows/ChromeOS, whole-system audio).
+window.__startAudioCapture = function(withWs, sourceType) {
+    sourceType = sourceType || 'mic';
     var sessionDiv = document.getElementById('session-data');
     if (!sessionDiv) { setStatus('Error: session data missing'); window.__audioStreamActive = false; window.__micTestActive = false; return; }
 
-    navigator.mediaDevices.getUserMedia({ audio: true })
+    var mediaPromise;
+    if (sourceType === 'display') {
+        // video:true is required by the getDisplayMedia spec even though we
+        // discard the track immediately below — only the audio is used.
+        mediaPromise = navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
+            .then(function(stream) {
+                stream.getVideoTracks().forEach(function(t) { stream.removeTrack(t); t.stop(); });
+                if (stream.getAudioTracks().length === 0) {
+                    stream.getTracks().forEach(function(t) { t.stop(); });
+                    throw new Error("No audio shared — check 'Share audio' in the picker");
+                }
+                return stream;
+            });
+    } else {
+        mediaPromise = navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+
+    mediaPromise
         .then(function(stream) {
             window.__mediaStream = stream;
             var AudioContext = window.AudioContext || window.webkitAudioContext;
@@ -408,7 +331,7 @@ window.__startAudioCapture = function(withWs) {
                 }
             };
         })
-        .catch(function(err) { setStatus('Mic error: ' + err.message); window.__audioStreamActive = false; window.__micTestActive = false; });
+        .catch(function(err) { setStatus((sourceType === 'display' ? 'Capture error: ' : 'Mic error: ') + err.message); window.__audioStreamActive = false; window.__micTestActive = false; });
 };
 
 window.__stopAudioCapture = function() {
@@ -428,11 +351,11 @@ window.stopBrowserStreaming = function() {
     setStatus('Stopped');
 };
 
-window.addEventListener('pagehide', function() {
-    var sessionDiv = document.getElementById('session-data');
-    if (sessionDiv && sessionDiv.dataset.session)
-        navigator.sendBeacon('/deactivate/' + sessionDiv.dataset.session, '');
-});
+// Note: tab close/reload used to call /deactivate here, which fully tore
+// down the session (unloaded models, stopped recognition). Sessions are now
+// permanent by default — closing this tab just stops this tab's audio
+// stream; the session itself stays alive until explicitly closed from the
+// "Manage Sessions" panel or reclaimed by the server's idle timeout.
 
 // ── Display + Logs polling (bypasses Gradio SSE entirely) ────────────────
 // Both fetch directly from FastAPI endpoints. Zero Gradio SSE queue usage.
@@ -491,948 +414,13 @@ document.addEventListener('DOMContentLoaded', function() {
 """
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def dots_or_stars(input_str: str, second_arg=None) -> bool:
-    if input_str == "." or re.match(r"<\|.*|>", input_str):
-        return True
-    return False
+# dots_or_stars, is_whisper_hallucination, ArgosTranslator, WhisperRecognizer
+# now live in recognizers.py — imported above.
 
+# FastVAD now lives in vad.py; MOONSHINE_LANGUAGES/MoonshineRecognizer now
+# live in recognizers.py — both imported above.
 
-# Known Whisper hallucinations produced when fed noise/silence/desk taps.
-# Whisper was trained on subtitles which have polite phrases at segment ends.
-# Any short segment that matches these exactly (case-insensitive, stripped) is dropped.
-_WHISPER_HALLUCINATIONS: set[str] = {
-    "thank you",
-    "thank you.",
-    "thanks for watching",
-    "thanks for watching.",
-    "thanks for watching!",
-    "thank you for watching",
-    "thank you for watching.",
-    "you",
-    "you.",
-    "bye",
-    "bye.",
-    "bye!",
-    "goodbye",
-    "goodbye.",
-    "like and subscribe",
-    "like and subscribe.",
-    "subscribe",
-    "music",
-    "music.",
-    "[music]",
-    "(music)",
-    "[applause]",
-    "(applause)",
-    "applause",
-    "applause.",
-    "[laughter]",
-    "(laughter)",
-    "laughter",
-    "hmm",
-    "hmm.",
-    "hm",
-    "hm.",
-    "uh",
-    "uh.",
-    "um",
-    "um.",
-    "ah",
-    "ah.",
-    "oh",
-    "oh.",
-    "okay",
-    "okay.",
-    "ok",
-    "ok.",
-    ".",
-    "..",
-    "...",
-    "…",
-    "[silence]",
-    "(silence)",
-    "[noise]",
-    "(noise)",
-    "[inaudible]",
-    "(inaudible)",
-    "subtitles by",
-    "subtitles by the amara.org community",
-    "www.mooji.org",
-    "www.facebook.com",
-    "the end",
-    "the end.",
-    "end.",
-}
-
-
-def is_whisper_hallucination(text: str) -> bool:
-    """Return True if text is a known Whisper hallucination / filler output."""
-    return text.strip().lower() in _WHISPER_HALLUCINATIONS
-
-
-# ── Argos Translate ───────────────────────────────────────────────────────────
-class ArgosTranslator:
-    """Offline translation using Argos Translate."""
-
-    def __init__(self, logger=None):
-        self.logger = logger
-        self.models_dir = Path("argos_models")
-        self.models_dir.mkdir(exist_ok=True)
-        if ARGOS_AVAILABLE:
-            argostranslate.package.settings.package_data_dir = str(self.models_dir)
-            try:
-                argostranslate.package.update_package_index()
-            except Exception as e:
-                if self.logger:
-                    self.logger.log(
-                        f"Argos package index update failed: {e}", level="warning"
-                    )
-
-    def translate(self, text, source_lang, target_lang):
-        if not ARGOS_AVAILABLE:
-            return f"[Argos not available: {text}]"
-        try:
-            installed = argostranslate.translate.get_installed_languages()
-            source = target = None
-            for lang in installed:
-                if lang.code == source_lang or lang.code.startswith(source_lang):
-                    source = lang
-                if lang.code == target_lang or lang.code.startswith(target_lang):
-                    target = lang
-            if not source or not target:
-                return f"[Model not installed: {text}]"
-            translation = source.get_translation(target)
-            if not translation:
-                return f"[No translation available: {text}]"
-            result = translation.translate(text)
-            if self.logger:
-                self.logger.log(f"Argos: {text} -> {result}", level="info")
-            return result
-        except Exception as e:
-            if self.logger:
-                self.logger.log(f"Argos translation error: {e}", level="error")
-            return text
-
-    def get_available_languages(self):
-        if not ARGOS_AVAILABLE:
-            return []
-        try:
-            installed = argostranslate.translate.get_installed_languages()
-            return [
-                (src.code, tgt.code, f"{src.name} -> {tgt.name}")
-                for src in installed
-                for tgt in src.translations_from
-            ]
-        except Exception as e:
-            if self.logger:
-                self.logger.log(f"Error getting Argos languages: {e}", level="error")
-            return []
-
-
-# ── Whisper Recognizer ────────────────────────────────────────────────────────
-class WhisperRecognizer:
-    """Whisper API-based speech recognizer with configurable parameters."""
-
-    def __init__(
-        self,
-        host,
-        api_key=None,
-        model="whisper-large-v3",
-        logger=None,
-        temperature=0.0,
-        best_of=5,
-        beam_size=5,
-        patience=1.0,
-        length_penalty=1.0,
-        suppress_tokens="-1",
-        initial_prompt=None,
-        condition_on_previous_text=True,
-        temperature_increment_on_fallback=0.2,
-        no_speech_threshold=0.6,
-        logprob_threshold=-1.0,
-        compression_ratio_threshold=2.4,
-    ):
-        self.host = host.rstrip("/")
-        self.api_key = api_key
-        self.model = model
-        self.logger = logger
-        self.session = requests.Session()
-        if api_key:
-            self.session.headers.update({"Authorization": f"Bearer {api_key}"})
-        self.temperature = temperature
-        self.best_of = best_of
-        self.beam_size = beam_size
-        self.patience = patience
-        self.length_penalty = length_penalty
-        self.suppress_tokens = suppress_tokens
-        self.initial_prompt = initial_prompt
-        self.condition_on_previous_text = condition_on_previous_text
-        self.temperature_increment_on_fallback = temperature_increment_on_fallback
-        self.no_speech_threshold = no_speech_threshold
-        self.logprob_threshold = logprob_threshold
-        self.compression_ratio_threshold = compression_ratio_threshold
-
-    def _build_data(self, language=None, task="transcribe"):
-        data = {
-            "model": self.model,
-            "response_format": "json",
-            "temperature": self.temperature,
-            "best_of": self.best_of,
-            "beam_size": self.beam_size,
-            "patience": self.patience,
-            "length_penalty": self.length_penalty,
-            "suppress_tokens": self.suppress_tokens,
-            "condition_on_previous_text": self.condition_on_previous_text,
-            "temperature_increment_on_fallback": self.temperature_increment_on_fallback,
-            "no_speech_threshold": self.no_speech_threshold,
-            "logprob_threshold": self.logprob_threshold,
-            "compression_ratio_threshold": self.compression_ratio_threshold,
-        }
-        if language:
-            data["language"] = language
-        if self.initial_prompt:
-            data["prompt"] = self.initial_prompt
-        return data
-
-    def transcribe(self, audio_bytes, sample_rate=16000, language=None):
-        try:
-            buffer = io.BytesIO()
-            with wave.open(buffer, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(sample_rate)
-                wf.writeframes(audio_bytes)
-            buffer.seek(0)
-            files = {"file": ("audio.wav", buffer, "audio/wav")}
-            data = self._build_data(language=language, task="transcribe")
-            response = self.session.post(
-                f"{self.host}/audio/transcriptions", files=files, data=data, timeout=30
-            )
-            if response.status_code == 200:
-                result = response.json()
-                return (
-                    result.get("text", "") if isinstance(result, dict) else str(result)
-                )
-            else:
-                if self.logger:
-                    self.logger.log(
-                        f"Whisper API error: {response.status_code} - {response.text}",
-                        level="error",
-                    )
-                return ""
-        except Exception as e:
-            if self.logger:
-                self.logger.log(f"Whisper transcription error: {e}", level="error")
-            return ""
-
-    def translate(self, audio_bytes, sample_rate=16000):
-        try:
-            buffer = io.BytesIO()
-            with wave.open(buffer, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(sample_rate)
-                wf.writeframes(audio_bytes)
-            buffer.seek(0)
-            files = {"file": ("audio.wav", buffer, "audio/wav")}
-            data = self._build_data(task="translate")
-            response = self.session.post(
-                f"{self.host}/audio/translations", files=files, data=data, timeout=30
-            )
-            if response.status_code == 200:
-                result = response.json()
-                return (
-                    result.get("text", "") if isinstance(result, dict) else str(result)
-                )
-            else:
-                if self.logger:
-                    self.logger.log(
-                        f"Whisper translation API error: {response.status_code}",
-                        level="error",
-                    )
-                return ""
-        except Exception as e:
-            if self.logger:
-                self.logger.log(f"Whisper translation error: {e}", level="error")
-            return ""
-
-
-# ── Fast Voice Activity Detector ─────────────────────────────────────────────
-# Primary backend: webrtcvad (pip install webrtcvad) — microsecond-fast per frame
-# Fallback:        optimised RMS energy check
-#
-# Design for minimum dispatch latency:
-#   • 10 ms frames at 16 kHz (160 samples = 320 bytes) — smallest webrtcvad unit
-#   • 3-frame pre-roll (30 ms) so speech onset is never clipped
-#   • 3 consecutive speech frames required to open a segment (30 ms min utterance)
-#   • 2 consecutive silence frames trigger immediate dispatch (20 ms end-of-speech)
-#   → total overhead after last spoken word: ~20 ms
-#
-# Only one user-tunable parameter: threshold 0.0–1.0
-#   webrtcvad: maps to aggressiveness 0 (sensitive) … 3 (strict)
-#   RMS fallback: maps to energy floor 0.002 … 0.05
-
-_WRTCVAD_AVAILABLE = False
-try:
-    import webrtcvad as _wrtcvad_mod
-
-    _WRTCVAD_AVAILABLE = True
-except ImportError:
-    pass
-
-# Fixed frame geometry — never change these
-_F_RATE = 16000
-_F_MS = 10
-_F_SAMP = _F_RATE * _F_MS // 1000  # 160 samples
-_F_BYTES = _F_SAMP * 2  # 320 bytes (int16 mono)
-_PREROLL = 3  # frames before speech onset (~30 ms)
-_MIN_SPCH = 3  # frames to confirm speech (~30 ms)
-# Minimum speech segment to dispatch to Whisper/Moonshine.
-# Segments shorter than this are almost always desk taps / breath / noise.
-# 500 ms = 50 frames.  Vosk is not affected (it handles segmentation itself).
-_MIN_DISPATCH_MS = 150
-_MIN_DISPATCH_FRAMES = _MIN_DISPATCH_MS // _F_MS  # 15
-# End-of-speech silence (default 300 ms = 30 frames).
-# ┌─ Whisper/Moonshine users: raise this if phrases are cut off mid-sentence.
-# │  Each unit = 10 ms. Recommended range: 20 (200 ms) … 60 (600 ms).
-# └─ Set via settings["vad_end_silence_ms"] in the UI.
-_DEFAULT_END_SLNC_FRAMES = 30
-
-
-class FastVAD:
-    """
-    Frame-level VAD with integrated, vectorized audio preprocessing.
-
-    Pipeline (applied to every audio block as a single numpy batch operation):
-      1. Transient suppression  — energy-ratio spike detector, zeroes click frames
-      2. Spectral subtraction   — tracks background PSD during silence, attenuates it
-      3. RMS energy gate        — user threshold in dBFS
-      4. webrtcvad confirmation — optional spectral speech-shape check (webrtcvad)
-
-    All processing is vectorized across the whole block at once (single FFT call),
-    so per-callback overhead is ~0.04 ms regardless of block size.
-    Works identically for Vosk, Whisper, and Moonshine (engine-agnostic).
-
-    Hot-reloadable: update_threshold / update_end_silence_ms / update_noise_filter
-    """
-
-    # ── constants cached at class level ──────────────────────────────────────
-    _WIN = np.hanning(_F_SAMP).astype(np.float32)  # shape (160,)
-    _WIN_SUM = float(np.sum(_WIN**2))  # normalisation
-    _N_FFT = 256  # padded FFT size
-    _N_BINS = _N_FFT // 2 + 1  # 129 rfft bins
-
-    def __init__(
-        self, threshold_db=-30.0, end_silence_ms=300, noise_filter_threshold=0.0
-    ):
-        self._end_silence_frames = max(2, end_silence_ms // _F_MS)
-        self._set_threshold(threshold_db)
-        self._set_noise_filter(noise_filter_threshold)
-        self._reset()
-
-        # Spectral subtraction state (shape: (_N_BINS,))
-        self._noise_psd: np.ndarray | None = None
-        self._prev_clean: np.ndarray | None = None
-
-        # Transient detector (scalar energy trackers)
-        self._lt_energy = 1e-6
-        self._st_energy = 1e-6
-
-        # webrtcvad (optional)
-        if _WRTCVAD_AVAILABLE:
-            self._vad_obj = _wrtcvad_mod.Vad(3)
-        else:
-            self._vad_obj = None
-
-    # ── hot-reload ────────────────────────────────────────────────────────────
-    def _set_threshold(self, db):
-        self.threshold = float(db)
-        self._rms_floor = 10 ** (self.threshold / 20.0)
-
-    def update_threshold(self, db):
-        self._set_threshold(db)
-
-    def update_end_silence_ms(self, ms):
-        self._end_silence_frames = max(2, int(ms) // _F_MS)
-
-    def _set_noise_filter(self, level):
-        self._filter_level = max(0.0, min(1.0, float(level)))
-        # Over-subtraction factor 1→4; spectral floor 0.05→0.001
-        self._ss_alpha = 1.0 + self._filter_level * 3.0
-        self._ss_floor = 0.05 * (1.0 - self._filter_level * 0.98)
-        # Transient ratio: disabled at 0, tight (8×) at 1.0, loose (48×) at 0.1
-        self._transient_ratio = (
-            float("inf")
-            if self._filter_level < 0.01
-            else 8.0 + (1.0 - self._filter_level) * 40.0
-        )
-
-    def update_noise_filter(self, level):
-        self._set_noise_filter(level)
-
-    def update_noise_filter_threshold(self, level):
-        self._set_noise_filter(level)
-
-    def set_noise_filter_threshold(self, level):
-        self._set_noise_filter(level)
-
-    # ── state ─────────────────────────────────────────────────────────────────
-    def _reset(self):
-        self._preroll: list[bytes] = []
-        self._segment: list[bytes] = []
-        self._in_speech = False
-        self._sil_count = 0
-        self._leftover = b""
-
-    def reset(self):
-        self._reset()
-
-    # ── vectorized block preprocessing ───────────────────────────────────────
-    def _preprocess_block_array(
-        self, frames: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Process a batch of frames in one vectorized operation.
-
-        Args:
-            frames: float32 array, shape (N, _F_SAMP), already normalised to ±1.
-
-        Returns:
-            clean:        float32 array, shape (N, _F_SAMP) — noise-suppressed
-            is_transient: bool array,    shape (N,)         — True = click/spike frame
-        """
-        N = frames.shape[0]
-        is_transient = np.zeros(N, dtype=bool)
-
-        if self._filter_level < 0.01:
-            return frames.copy(), is_transient  # filter off — zero overhead
-
-        # ── 1. Transient detection (per-frame energy, iterative but scalar) ──
-        energies = np.mean(frames**2, axis=1) + 1e-10  # (N,)
-        for i in range(N):
-            e = float(energies[i])
-            self._lt_energy = 0.999 * self._lt_energy + 0.001 * e
-            self._st_energy = 0.85 * self._st_energy + 0.15 * e
-            if (self._st_energy / self._lt_energy) > self._transient_ratio:
-                is_transient[i] = True
-
-        # Zero out transient frames before FFT so they don't corrupt the noise model
-        frames_proc = frames.copy()
-        frames_proc[is_transient] = 0.0
-
-        # ── 2. Spectral subtraction (fully vectorized) ────────────────────────
-        # Apply Hanning window to all frames at once: (N, _F_SAMP)
-        windowed = frames_proc * self._WIN  # broadcast (N,160) * (160,)
-
-        # Batch forward FFT: (N, _N_BINS) complex
-        spectra = np.fft.rfft(windowed, n=self._N_FFT, axis=1)
-        power = np.abs(spectra) ** 2  # (N, _N_BINS)
-
-        # Update noise PSD only from frames below the RMS threshold (silence)
-        rms_per_frame = np.sqrt(energies)
-        silent_mask = rms_per_frame < self._rms_floor  # (N,)
-        if np.any(silent_mask):
-            noise_mean = np.mean(power[silent_mask], axis=0)  # (N_BINS,)
-            if self._noise_psd is None:
-                self._noise_psd = noise_mean
-            else:
-                self._noise_psd = 0.98 * self._noise_psd + 0.02 * noise_mean
-
-        if self._noise_psd is None:
-            return frames_proc, is_transient  # No noise estimate yet
-
-        # Subtract scaled noise PSD from each frame's power
-        noise = self._noise_psd[np.newaxis, :]  # (1, N_BINS) broadcast
-        clean_power = power - self._ss_alpha * noise  # (N, N_BINS)
-
-        # Half-wave rectify + spectral floor
-        floor = self._ss_floor * noise
-        clean_power = np.maximum(clean_power, floor)
-
-        # Temporal smoothing to reduce musical noise: blend with previous frame's spectrum
-        if self._prev_clean is not None:
-            clean_power = 0.85 * self._prev_clean + 0.15 * clean_power
-        self._prev_clean = clean_power[-1:].copy()  # keep last frame for next call
-
-        # Compute gain and apply to original (unwindowed) spectra
-        gain = np.sqrt(clean_power / (power + 1e-12))  # (N, N_BINS)
-        gain = np.minimum(gain, 1.0)  # never amplify
-        clean_spectra = spectra * gain  # (N, N_BINS)
-
-        # Batch inverse FFT and take first _F_SAMP samples: (N, _F_SAMP)
-        clean = np.fft.irfft(clean_spectra, n=self._N_FFT, axis=1)[:, :_F_SAMP]
-
-        # Normalise windowing: scale by frame_length / window_energy
-        if self._WIN_SUM > 0:
-            clean = clean * (_F_SAMP / self._WIN_SUM)
-
-        return clean.astype(np.float32), is_transient
-
-    # ── public API ────────────────────────────────────────────────────────────
-    def preprocess_block(self, audio_bytes: bytes) -> bytes:
-        """
-        Denoise a raw audio block (int16, 16 kHz, mono).
-        Returns cleaned int16 bytes, same length as input.
-        Used by Vosk and Moonshine which manage their own segmentation.
-        """
-        if self._filter_level < 0.01:
-            return audio_bytes
-
-        n_full = len(audio_bytes) // _F_BYTES
-        tail = audio_bytes[n_full * _F_BYTES :]
-
-        if n_full == 0:
-            return audio_bytes
-
-        # Decode entire block at once
-        raw = np.frombuffer(audio_bytes[: n_full * _F_BYTES], dtype=np.int16)
-        frames = raw.reshape(n_full, _F_SAMP).astype(np.float32) / 32768.0
-
-        clean, _ = self._preprocess_block_array(frames)
-
-        # Clip and re-encode to int16
-        out = np.clip(clean * 32767.0, -32768, 32767).astype(np.int16)
-        return out.tobytes() + tail  # append any sub-frame tail unchanged
-
-    def process_chunk(self, audio_bytes: bytes) -> list[bytes]:
-        """
-        VAD segmentation + denoising for Whisper.
-        Returns list of complete speech segments (cleaned int16 bytes).
-        """
-        data = self._leftover + audio_bytes
-        n_full = (len(data)) // _F_BYTES
-        tail = data[n_full * _F_BYTES :]
-
-        segments: list[bytes] = []
-
-        if n_full == 0:
-            self._leftover = tail
-            return segments
-
-        # Decode and preprocess all frames in one batch
-        raw = np.frombuffer(data[: n_full * _F_BYTES], dtype=np.int16)
-        frames = raw.reshape(n_full, _F_SAMP).astype(np.float32) / 32768.0
-        clean_f, is_transient = self._preprocess_block_array(frames)
-
-        # Re-encode cleaned frames to int16 bytes once
-        clean_int16 = np.clip(clean_f * 32767.0, -32768, 32767).astype(np.int16)
-        frame_bytes = [clean_int16[i].tobytes() for i in range(n_full)]
-
-        # Compute per-frame RMS on cleaned audio for the energy gate
-        rms_per_frame = np.sqrt(np.mean(clean_f**2, axis=1))  # (N,)
-
-        # Run VAD state machine over the preprocessed frames
-        for i in range(n_full):
-            fb = frame_bytes[i]
-            rms = float(rms_per_frame[i])
-
-            # A transient or below-threshold frame counts as silence
-            if is_transient[i] or rms < self._rms_floor:
-                is_speech = False
-            elif self._vad_obj is not None:
-                try:
-                    is_speech = bool(self._vad_obj.is_speech(fb, _F_RATE))
-                except Exception:
-                    is_speech = True
-            else:
-                is_speech = True
-
-            if is_speech:
-                if not self._in_speech:
-                    self._segment = list(self._preroll) + [fb]
-                    self._in_speech = True
-                    self._sil_count = 0
-                else:
-                    self._segment.append(fb)
-                    self._sil_count = 0
-                self._preroll.append(fb)
-                if len(self._preroll) > _PREROLL:
-                    self._preroll.pop(0)
-            else:
-                if self._in_speech:
-                    self._segment.append(fb)
-                    self._sil_count += 1
-                    if self._sil_count >= self._end_silence_frames:
-                        # Only dispatch segments long enough to contain real speech.
-                        # Short bursts (desk tap, breath, click that slipped past) are dropped.
-                        if len(self._segment) >= _MIN_DISPATCH_FRAMES:
-                            segments.append(b"".join(self._segment))
-                        self._segment = []
-                        self._in_speech = False
-                        self._sil_count = 0
-                else:
-                    self._preroll.append(fb)
-                    if len(self._preroll) > _PREROLL:
-                        self._preroll.pop(0)
-
-        self._leftover = tail
-        return segments
-
-    def flush(self) -> bytes | None:
-        seg = None
-        if self._in_speech and len(self._segment) >= _MIN_SPCH:
-            seg = b"".join(self._segment)
-        self._reset()
-        return seg
-
-    def is_speech_rms(self, audio_bytes: bytes) -> bool:
-        """Simple energy gate for Vosk (no state change)."""
-        s = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        return float(np.sqrt(np.mean(s**2))) > self._rms_floor
-
-    # Backward-compat stubs
-    def _rms(self, frame: bytes) -> float:
-        s = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
-        return float(np.sqrt(np.mean(s**2)))
-
-    def is_noise_by_spectrum(self, frame: bytes) -> bool:
-        """Kept for backward compat."""
-        raw = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
-        e = float(np.mean(raw**2)) + 1e-10
-        st = 0.85 * self._st_energy + 0.15 * e
-        return (st / max(self._lt_energy, 1e-10)) > self._transient_ratio
-
-
-# ── Moonshine Recognizer ──────────────────────────────────────────────────────
-# Uses the official moonshine-voice package (pip install moonshine-voice).
-# Models are downloaded automatically via get_model_for_language().
-# The library handles VAD, segmentation, and streaming internally.
-#
-# Supported languages (as of current moonshine-voice release):
-#   en  es  zh  ja  ko  vi  uk  ar
-
-MOONSHINE_LANGUAGES = [
-    ("English", "en"),
-    ("Spanish", "es"),
-    ("Mandarin Chinese", "zh"),
-    ("Japanese", "ja"),
-    ("Korean", "ko"),
-    ("Vietnamese", "vi"),
-    ("Ukrainian", "uk"),
-    ("Arabic", "ar"),
-]
-MOONSHINE_LANGUAGE_CODES = [code for _, code in MOONSHINE_LANGUAGES]
-
-_MOONSHINE_AVAILABLE = False
-try:
-    import moonshine_voice as _mv_mod
-
-    _MOONSHINE_AVAILABLE = True
-except ImportError:
-    pass
-
-
-class MoonshineRecognizer:
-    """
-    Wraps moonshine_voice.Transcriber.
-    Feed raw int16 16 kHz mono bytes via add_audio(); results arrive through
-    the on_result callback as (text: str, is_final: bool).
-    """
-
-    def __init__(
-        self,
-        language: str = "en",
-        cache_dir: str = "moonshine_models",
-        on_result=None,  # callable(text: str, is_final: bool)
-        logger=None,
-    ):
-        self.language = language
-        self.cache_dir = cache_dir
-        self.on_result = on_result
-        self.logger = logger
-        self._transcriber = None
-        self._started = False
-
-    def start(self):
-        """Download model if needed, create Transcriber, start session."""
-        if not _MOONSHINE_AVAILABLE:
-            raise ImportError(
-                "moonshine-voice is not installed. Run: pip install moonshine-voice"
-            )
-        try:
-            # Force absolute path so the native C++ library can locate cached models
-            # regardless of the process working directory.
-            abs_cache = os.path.abspath(self.cache_dir)
-            os.makedirs(abs_cache, exist_ok=True)
-            os.environ["MOONSHINE_VOICE_CACHE"] = abs_cache
-
-            if self.logger:
-                self.logger.log(
-                    f"Loading Moonshine for language '{self.language}' "
-                    f"(downloads model automatically if not cached)…",
-                    level="info",
-                )
-
-            model_path, model_arch = _mv_mod.get_model_for_language(self.language)
-
-            # The C++ core resolves paths from the process working directory.
-            # get_model_for_language() may return a relative path (inside the cache
-            # folder), which the native library can't find unless we expand it first.
-            model_path = os.path.abspath(model_path)
-
-            if self.logger:
-                self.logger.log(
-                    f"Moonshine model ready: {model_path} (arch {model_arch})",
-                    level="info",
-                )
-
-            # Inner listener — closes over self to push results to the app queue
-            outer = self
-
-            class _Listener(_mv_mod.TranscriptEventListener):
-                def on_line_text_changed(self, event):
-                    if outer.on_result and event.line.text:
-                        outer.on_result(event.line.text, False)
-
-                def on_line_completed(self, event):
-                    if outer.on_result and event.line.text:
-                        outer.on_result(event.line.text, True)
-
-            self._transcriber = _mv_mod.Transcriber(
-                model_path=model_path,
-                model_arch=model_arch,
-            )
-            self._transcriber.add_listener(_Listener())
-            self._transcriber.start()
-            self._started = True
-
-        except Exception as exc:
-            if self.logger:
-                self.logger.log(f"Moonshine start error: {exc}", level="error")
-            raise
-
-    def add_audio(self, audio_bytes: bytes, sample_rate: int = 16000):
-        """Feed int16 mono bytes; the library handles VAD and segmentation."""
-        if self._transcriber is None or not self._started:
-            return
-        audio_np = (
-            np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        )
-        self._transcriber.add_audio(audio_np, sample_rate)
-
-    def close(self):
-        """Stop transcription and release resources."""
-        if self._transcriber and self._started:
-            try:
-                self._transcriber.stop()
-            except Exception:
-                pass
-        self._transcriber = None
-        self._started = False
-        gc.collect()
-
-
-# ── Subtitle Manager ──────────────────────────────────────────────────────────
-class SubtitleManager:
-    """
-    Buffers and paces subtitle display.
-
-    instant mode  – shows text immediately, fades after timeout.
-    buffered mode – queues sentences, pops max_lines at a time,
-                    holds each chunk for len(chunk)/cps seconds (min 1.5 s).
-    """
-
-    def __init__(
-        self,
-        mode: str = "instant",
-        cps: int = 21,
-        max_lines: int = 2,
-        fade_timeout: float = 5.0,
-    ):
-        self._lock = threading.Lock()
-        # Initialize attributes directly
-        self.mode = mode
-        self.cps = max(1, cps)
-        self.max_lines = max(1, max_lines)
-        self.fade_timeout = max(0.5, fade_timeout)
-        self._clear_state()
-
-    def _clear_state(self):
-        self._rec_queue: list[str] = []
-        self._trans_queue: list[str] = []
-        self._cur_rec = ""
-        self._cur_trans = ""
-        # Preserve the last final separately so a partial-overwrite can be recovered
-        self._last_final_rec = ""
-        self._last_final_trans = ""
-        self._show_until = 0.0
-        self._last_add = 0.0  # 0 means "nothing ever received"
-
-    def update_settings(
-        self,
-        mode: str | None = None,
-        cps: int | None = None,
-        max_lines: int | None = None,
-        fade_timeout: float | None = None,
-    ):
-        with self._lock:
-            old_mode = self.mode
-            if mode is not None:
-                self.mode = mode
-            if cps is not None:
-                self.cps = max(1, cps)
-            if max_lines is not None:
-                self.max_lines = max(1, max_lines)
-            if fade_timeout is not None:
-                self.fade_timeout = max(0.5, fade_timeout)
-
-            # When switching from buffered to instant, clear the queue
-            if old_mode != self.mode and self.mode == "instant":
-                self._rec_queue.clear()
-                self._trans_queue.clear()
-
-    def set_interim(self, text: str):
-        """
-        Update the live-preview text WITHOUT disturbing the subtitle queue.
-        In buffered mode, interims are shown as temporary overlays.
-        """
-        with self._lock:
-            stripped = (text or "").strip()
-            if stripped:
-                self._cur_rec = stripped
-                self._last_add = time.time()
-            # else: ignore empty interim – keep previous text
-
-    def _split_into_sentences(self, text: str, max_chars: int = 100) -> list[str]:
-        """Split text into sentences. If punctuation is missing, split by length."""
-        if not text:
-            return []
-        # First try punctuation-based split
-        sentences = re.split(r"(?<=[.!?;:])\s+", text)
-        sentences = [s.strip() for s in sentences if s.strip()]
-
-        # If we got only one sentence or any sentence is too long, do length-based split
-        result = []
-        for sent in sentences:
-            if len(sent) <= max_chars:
-                result.append(sent)
-            else:
-                # Split long sentence into chunks of max_chars at word boundaries
-                words = sent.split()
-                chunks = []
-                current_chunk = []
-                current_len = 0
-                for word in words:
-                    # +1 for space (except for first word in chunk)
-                    if (
-                        current_len + len(word) + (1 if current_chunk else 0)
-                        <= max_chars
-                    ):
-                        current_chunk.append(word)
-                        current_len += len(word) + (1 if current_chunk else 0)
-                    else:
-                        if current_chunk:
-                            chunks.append(" ".join(current_chunk))
-                        current_chunk = [word]
-                        current_len = len(word)
-                if current_chunk:
-                    chunks.append(" ".join(current_chunk))
-                result.extend(chunks)
-        return result
-
-    def add(self, recognized: str, translated: str = ""):
-        recognized = (recognized or "").strip()
-        translated = (translated or "").strip()
-        if not recognized:
-            return
-        with self._lock:
-            self._last_add = time.time()
-            self._last_final_rec = recognized
-            self._last_final_trans = translated
-
-            if self.mode == "instant":
-                self._cur_rec = recognized
-                self._cur_trans = translated
-            else:
-                # Buffered mode: split recognized text into sentences/chunks
-                sentences = self._split_into_sentences(recognized, max_chars=100)
-
-                # If we have translation, split it similarly
-                if translated:
-                    trans_sentences = self._split_into_sentences(
-                        translated, max_chars=100
-                    )
-                    # Pad or truncate to match number of sentences
-                    if len(trans_sentences) < len(sentences):
-                        trans_sentences += [""] * (
-                            len(sentences) - len(trans_sentences)
-                        )
-                    elif len(trans_sentences) > len(sentences):
-                        trans_sentences = trans_sentences[: len(sentences)]
-                else:
-                    trans_sentences = [""] * len(sentences)
-
-                # Queue each sentence/chunk individually
-                for rec_sent, trans_sent in zip(sentences, trans_sentences):
-                    self._rec_queue.append(rec_sent)
-                    self._trans_queue.append(trans_sent)
-
-                # If nothing is currently showing, display the next chunk immediately
-                if not self._cur_rec and not self._cur_trans:
-                    # Show first chunk immediately
-                    rec_lines, trans_lines = [], []
-                    for _ in range(min(self.max_lines, len(self._rec_queue))):
-                        rec_lines.append(self._rec_queue.pop(0))
-                        if self._trans_queue:
-                            trans_lines.append(self._trans_queue.pop(0))
-
-                    self._cur_rec = ", ".join(rec_lines)
-                    self._cur_trans = ", ".join(trans_lines)
-                    text_length = len(self._cur_rec)
-                    hold = max(text_length / self.cps, 2.5)
-                    self._show_until = time.time() + hold
-
-    def get_display(self) -> tuple[str, str]:
-        """Return (recognized, translated) for the current render frame."""
-        with self._lock:
-            now = time.time()
-
-            if self.mode == "instant":
-                if self._last_add == 0.0:
-                    return "", ""
-                if self._cur_rec or self._cur_trans:
-                    if now - self._last_add <= self.fade_timeout:
-                        rec = self._cur_rec if self._cur_rec else self._last_final_rec
-                        trans = (
-                            self._cur_trans
-                            if self._cur_trans
-                            else self._last_final_trans
-                        )
-                        return rec, trans
-                return "", ""
-
-            # ========== BUFFERED MODE ==========
-            # If we have queued sentences and nothing is currently showing, show the next chunk
-            if self._rec_queue and not self._cur_rec and not self._cur_trans:
-                rec_lines, trans_lines = [], []
-                for _ in range(min(self.max_lines, len(self._rec_queue))):
-                    rec_lines.append(self._rec_queue.pop(0))
-                    if self._trans_queue:
-                        trans_lines.append(self._trans_queue.pop(0))
-
-                self._cur_rec = ", ".join(rec_lines)
-                self._cur_trans = ", ".join(trans_lines)
-                text_length = len(self._cur_rec)
-                hold = max(text_length / self.cps, 2.5)  # Minimum 2.5 seconds
-                self._show_until = now + hold
-                return self._cur_rec, self._cur_trans
-
-            # If current text exists, check if it has expired
-            if self._cur_rec or self._cur_trans:
-                if now >= self._show_until:
-                    # Text expired - clear it
-                    self._cur_rec = ""
-                    self._cur_trans = ""
-                    return "", ""
-                return self._cur_rec, self._cur_trans
-
-            return "", ""
-
-    def clear(self):
-        with self._lock:
-            self._clear_state()
-
+# SubtitleManager now lives in subtitles.py — imported above.
 
 # ── VoiceTranslatorApp ────────────────────────────────────────────────────────
 class VoiceTranslatorApp:
@@ -1468,9 +456,15 @@ class VoiceTranslatorApp:
         "libretranslate_host": "",
         "libretranslate_api_key": "",
         "fade_timeout": 5.0,
-        "ai_host": "",
+        "ai_host": "http://localhost:11434",
         "ai_api_key": "",
         "ai_model": "",
+        # Advanced/developer overrides for AI-translation prompt + endpoint —
+        # blank means "use the built-in default", see AI_TRANSLATION.md.
+        "ai_translation_prompt_template": "",
+        "ai_endpoint_url": "",
+        "ai_request_body_template": "",
+        "ai_response_text_path": "",
         "outline_width": 0,
         "outline_color": "#000000",
         "translated_outline_width": 0,
@@ -1502,7 +496,7 @@ class VoiceTranslatorApp:
         "whisper_translate_compression_ratio_threshold": 2.4,
         # VAD — threshold + end-of-speech delay are both hot-reloadable
         "vad_threshold": -30.0,  # dB — the slider value is now in dB directly
-        "vad_end_silence_ms": 80,  # ms of silence before dispatching (Whisper/Moonshine)
+        "vad_end_silence_ms": 300,  # ms of silence before dispatching (Whisper/Moonshine) — was 80ms, too short: natural mid-sentence pauses (breathing, thinking) routinely exceed that, so Whisper got flooded with tiny fragmented clips, which is exactly when it hallucinates fillers like "thank you"
         # Moonshine (moonshine-voice package)
         "moonshine_language": "en",
         "moonshine_cache_dir": "moonshine_models",
@@ -1513,10 +507,11 @@ class VoiceTranslatorApp:
         "noise_filter_threshold": 0.0,
     }
 
-    def __init__(self, session_hash: str):
+    def __init__(self, slug: str):
         self.session_active = True
         self.display_running = True
-        self.session_hash = session_hash
+        self.slug = slug
+        self.last_active = time.time()
         self.popout_id = secrets.token_urlsafe(16)
 
         self.audio_queue: queue.Queue = (
@@ -1528,6 +523,7 @@ class VoiceTranslatorApp:
 
         self.recognizer = None
         self.model = None
+        self._vosk_model_path: str | None = None  # which path self.model is a shared reference to — needed by _unload_vosk to release the right cache entry
         self.whisper_recognizer: WhisperRecognizer | None = None
         self.moonshine_recognizer: MoonshineRecognizer | None = None
         self.argos_translator: ArgosTranslator | None = None
@@ -1539,14 +535,30 @@ class VoiceTranslatorApp:
 
         self._transcribe_sem = threading.Semaphore(3)
 
+        # Serializes start/stop/monitor transitions. Without this, Gradio's
+        # concurrency settings (interface.queue(default_concurrency_limit=None))
+        # allow two clicks on this session — e.g. a fast Start-then-Stop, or a
+        # double-click — to run start_recognition()/stop_recognition() on two
+        # different threads AT THE SAME TIME. That's a real crash vector: Vosk's
+        # recognizer/model are C++ objects, and one thread deleting them (stop)
+        # while another thread is mid-call into them (start's processing loop,
+        # or vice versa) is undefined behavior — it can hard-crash the whole
+        # Python process, not just raise a catchable exception. That matches
+        # "the service restarts when I start and stop a model."
+        self._control_lock = threading.RLock()
+
         self.vosk_audio_buffer = bytearray()
         self.last_audio_chunk: bytes | None = None
 
-        self.logger = Logger(session_id=session_hash)
+        self.logger = Logger(session_id=slug)
 
         # Build settings: start from defaults, overlay saved settings
         self.settings: dict = dict(self.DEFAULT_SETTINGS)
-        self.settings.update(load_saved_settings())
+        self.settings.update(load_saved_settings(slug))
+        # Migrate old "browser" audio_mode value → "browser_mic" (Phase 3
+        # split the old single browser mode into mic vs tab/system audio).
+        if self.settings.get("audio_mode") == "browser":
+            self.settings["audio_mode"] = "browser_mic"
 
         # Subtitle manager — settings applied dynamically
         self.subtitles = SubtitleManager(
@@ -1612,7 +624,7 @@ class VoiceTranslatorApp:
         """Push latest threshold + end_silence + noise filter into the running VAD."""
         if self.vad:
             self.vad.update_threshold(self.settings.get("vad_threshold", -30.0))
-            self.vad.update_end_silence_ms(self.settings.get("vad_end_silence_ms", 80))
+            self.vad.update_end_silence_ms(self.settings.get("vad_end_silence_ms", 300))
             thresh = self.settings.get("noise_filter_threshold", 0.0)
             self.vad.update_noise_filter_threshold(thresh)
 
@@ -1642,39 +654,49 @@ class VoiceTranslatorApp:
             self.monitor_level = float(np.sqrt(np.mean(samples**2)))
 
     def start_mic_monitor(self) -> str:
-        if self.is_running:
-            return "⚠️ Recognition is active — level already visible in the meter"
-        if self.is_monitoring:
-            return "Already monitoring"
-        mic = self.settings.get("microphone")
-        if mic is None:
-            return "❌ No microphone selected"
+        if not self._control_lock.acquire(timeout=2.0):
+            return "⏳ Still starting/stopping — try again in a moment"
         try:
-            self._monitor_stream = sd.RawInputStream(
-                samplerate=16000,
-                blocksize=480,  # 30 ms — fast meter updates
-                device=mic,
-                dtype="int16",
-                channels=1,
-                callback=self._monitor_callback,
-            )
-            self._monitor_stream.start()
-            self.is_monitoring = True
-            return "🎙️ Mic monitor active — adjust threshold until line sits above background noise"
-        except Exception as exc:
-            return f"❌ Monitor error: {exc}"
+            if self.is_running:
+                return "⚠️ Recognition is active — level already visible in the meter"
+            if self.is_monitoring:
+                return "Already monitoring"
+            mic = self.settings.get("microphone")
+            if mic is None:
+                return "❌ No microphone selected"
+            try:
+                self._monitor_stream = sd.RawInputStream(
+                    samplerate=16000,
+                    blocksize=480,  # 30 ms — fast meter updates
+                    device=mic,
+                    dtype="int16",
+                    channels=1,
+                    callback=self._monitor_callback,
+                )
+                self._monitor_stream.start()
+                self.is_monitoring = True
+                return "🎙️ Mic monitor active — adjust threshold until line sits above background noise"
+            except Exception as exc:
+                return f"❌ Monitor error: {exc}"
+        finally:
+            self._control_lock.release()
 
     def stop_mic_monitor(self) -> str:
-        if self._monitor_stream:
-            try:
-                self._monitor_stream.stop()
-                self._monitor_stream.close()
-            except Exception:
-                pass
-            self._monitor_stream = None
-        self.is_monitoring = False
-        self.monitor_level = 0.0
-        return "⏹️ Monitor stopped"
+        if not self._control_lock.acquire(timeout=5.0):
+            return "⏳ Still busy — try Stop again in a moment"
+        try:
+            if self._monitor_stream:
+                try:
+                    self._monitor_stream.stop()
+                    self._monitor_stream.close()
+                except Exception:
+                    pass
+                self._monitor_stream = None
+            self.is_monitoring = False
+            self.monitor_level = 0.0
+            return "⏹️ Monitor stopped"
+        finally:
+            self._control_lock.release()
 
     # ── Audio processing ──────────────────────────────────────────────────────
     def audio_callback(self, indata, frames, time_info, status):
@@ -1701,7 +723,7 @@ class VoiceTranslatorApp:
         if self.vad is None:
             self.vad = FastVAD(
                 threshold_db=self.settings.get("vad_threshold", -30.0),
-                end_silence_ms=self.settings.get("vad_end_silence_ms", 80),
+                end_silence_ms=self.settings.get("vad_end_silence_ms", 300),
                 noise_filter_threshold=self.settings.get("noise_filter_threshold", 0.0),
             )
         return self.vad
@@ -1711,6 +733,11 @@ class VoiceTranslatorApp:
         Feed audio to Vosk. Noise preprocessing applied first so Vosk receives
         cleaner audio. Vosk's own endpointer handles segmentation.
         """
+        if self.recognizer is None:
+            # Engine was switched away from vosk (or we're mid-stop) while a
+            # block was already in flight to this thread — drop it instead of
+            # crashing on a None recognizer.
+            return
         vad = self._get_or_create_vad()
         clean = vad.preprocess_block(data)
         self.vosk_audio_buffer.extend(clean)
@@ -1809,7 +836,26 @@ class VoiceTranslatorApp:
 
     # ── Recognition control ───────────────────────────────────────────────────
     def start_recognition(self, model_path: str | None, microphone_index=None) -> str:
+        # Non-blocking: a rapid double-click on Start should be rejected
+        # immediately rather than queue up and fire a second start while the
+        # first is still loading a model.
+        if not self._control_lock.acquire(timeout=0.1):
+            return "⏳ Already starting or stopping — please wait a moment"
         try:
+            if self.is_running:
+                return "⚠️ Already running — press Stop first"
+
+            # Defensive: release any vosk model reference from a previous run
+            # that wasn't cleanly stopped. Shouldn't happen given the
+            # is_running guard + stop-before-start invariant, but a leaked
+            # cache refcount would slowly starve RAM over time, so make sure
+            # every start begins from a clean slate regardless.
+            if self._vosk_model_path:
+                _release_vosk_model(self._vosk_model_path)
+                self._vosk_model_path = None
+            self.model = None
+            self.recognizer = None
+
             engine = self.settings["recognition_engine"]
 
             if engine == "vosk":
@@ -1817,7 +863,8 @@ class VoiceTranslatorApp:
                     msg = "❌ Vosk model not found. Place model in vosk_models/"
                     self.logger.log(msg, level="error")
                     return msg
-                self.model = Model(model_path)
+                self.model = _acquire_vosk_model(model_path)
+                self._vosk_model_path = model_path
                 self.recognizer = KaldiRecognizer(self.model, 16000)
                 self.recognizer.SetWords(True)
                 self.whisper_recognizer = None
@@ -1874,7 +921,7 @@ class VoiceTranslatorApp:
                 self.vad.flush()
             self.vad = FastVAD(
                 threshold_db=self.settings.get("vad_threshold", -30.0),
-                end_silence_ms=self.settings.get("vad_end_silence_ms", 80),
+                end_silence_ms=self.settings.get("vad_end_silence_ms", 300),
                 noise_filter_threshold=self.settings.get("noise_filter_threshold", 0.0),
             )
 
@@ -1929,56 +976,79 @@ class VoiceTranslatorApp:
             msg = f"❌ Error starting recognition: {exc}"
             self.logger.log(msg, level="error")
             return msg
+        finally:
+            self._control_lock.release()
 
     def stop_recognition(self) -> str:
         """
         Stop audio capture and unload all recognition models to free memory.
         Settings are fully preserved – pressing Start again will reload models.
         """
-        self.is_running = False
+        # Blocking with a generous timeout: if Start is mid-way through loading
+        # a big model, Stop should wait for that to finish and then unload it
+        # cleanly, rather than race it. Better a brief wait than a crash.
+        if not self._control_lock.acquire(timeout=30.0):
+            return "⏳ Still starting — press Stop again in a moment"
+        try:
+            if not self.is_running and self.stream is None and self.recognizer is None:
+                return "Already stopped"
+            self.is_running = False
 
-        # Stop hardware stream
-        if self.stream:
-            try:
-                self.stream.stop()
-                self.stream.close()
-            except Exception:
-                pass
-            self.stream = None
+            # Stop hardware stream
+            if self.stream:
+                try:
+                    self.stream.stop()
+                    self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
 
-        # Clear audio buffers
-        self.vosk_audio_buffer.clear()
+            # Give the processing thread a moment to see is_running=False and
+            # exit its loop before we start deleting the objects it's using.
+            pt = getattr(self, "process_thread", None)
+            if pt and pt.is_alive():
+                pt.join(timeout=1.0)
 
-        # Flush any speech the VAD was accumulating mid-utterance (Whisper only)
-        if self.vad:
-            leftover = self.vad.flush()
-            engine = self.settings.get("recognition_engine", "vosk")
-            if leftover and engine == "whisper":
-                # Dispatch synchronously before tearing down the recognizer
-                self._do_transcribe(engine, leftover)
-            self.vad = None
+            # Clear audio buffers
+            self.vosk_audio_buffer.clear()
 
-        # Unload Vosk model to free memory
-        self._unload_vosk()
+            # Flush any speech the VAD was accumulating mid-utterance (Whisper only)
+            if self.vad:
+                leftover = self.vad.flush()
+                engine = self.settings.get("recognition_engine", "vosk")
+                if leftover and engine == "whisper":
+                    # Dispatch synchronously before tearing down the recognizer
+                    self._do_transcribe(engine, leftover)
+                self.vad = None
 
-        # Unload Whisper
-        self.whisper_recognizer = None
+            # Unload Vosk model to free memory
+            self._unload_vosk()
 
-        # Stop Moonshine — its Transcriber.stop() fires on_line_completed for any open line
-        if self.moonshine_recognizer:
-            self.moonshine_recognizer.close()
-            self.moonshine_recognizer = None
+            # Unload Whisper
+            self.whisper_recognizer = None
 
-        self.translation_service = None
+            # Stop Moonshine — its Transcriber.stop() fires on_line_completed for any open line
+            if self.moonshine_recognizer:
+                self.moonshine_recognizer.close()
+                self.moonshine_recognizer = None
 
-        gc.collect()
+            self.translation_service = None
 
-        msg = "⏹️ Recognition stopped (models unloaded)"
-        self.logger.log(msg, level="success")
-        return msg
+            gc.collect()
+
+            msg = "⏹️ Recognition stopped (models unloaded)"
+            self.logger.log(msg, level="success")
+            return msg
+        finally:
+            self._control_lock.release()
 
     def _unload_vosk(self):
-        """Explicitly delete Vosk C++ objects and run GC."""
+        """
+        Release this session's KaldiRecognizer (always exclusive to this
+        session — cheap) and its reference to the shared Vosk Model (only
+        actually unloaded from RAM once every session using that same model
+        path has stopped — see _release_vosk_model).
+        """
         if self.recognizer:
             try:
                 del self.recognizer
@@ -1986,11 +1056,9 @@ class VoiceTranslatorApp:
                 pass
             self.recognizer = None
         if self.model:
-            try:
-                del self.model
-            except Exception:
-                pass
+            _release_vosk_model(self._vosk_model_path)
             self.model = None
+            self._vosk_model_path = None
         for _ in range(3):
             gc.collect()
 
@@ -2307,11 +1375,15 @@ class VoiceTranslatorApp:
 
         self.argos_translator = None
         gc.collect()
-        print(f"[SESSION CLOSED] {self.session_hash[:8]}")
+        print(f"[SESSION CLOSED] {self.slug}")
 
     def deactivate_session(self):
         self.session_active = False
         self.close()
+
+    def touch(self):
+        """Mark this session as recently active (used by the idle reaper)."""
+        self.last_active = time.time()
 
 
 # ── Global helpers ────────────────────────────────────────────────────────────
@@ -2359,19 +1431,110 @@ def _migrate_vad_threshold(v) -> float:
     return max(-60.0, min(0.0, v))
 
 
-def get_or_create_app(session_hash: str) -> VoiceTranslatorApp:
-    with SESSION_LOCK:
-        if session_hash not in SESSION_APPS:
-            SESSION_APPS[session_hash] = VoiceTranslatorApp(session_hash)
-            print(f"[NEW SESSION] {session_hash[:8]} | Total: {len(SESSION_APPS)}")
-        return SESSION_APPS[session_hash]
+# ── Shared Vosk model cache ───────────────────────────────────────────────────
+# Vosk's own API is explicitly designed for this: one Model (the large,
+# memory-heavy object — hundreds of MB to a few GB depending on which model)
+# can back many independent KaldiRecognizer instances at once, safely, across
+# threads. Previously every session called Model(model_path) itself, so two
+# sessions using the *same* model path loaded it into RAM twice, three
+# sessions loaded it three times, etc. This cache loads each distinct model
+# path once and hands out a refcounted reference; the Model is only actually
+# freed once every session using it has stopped. Whisper (remote API) and
+# Moonshine (small ONNX models with per-session streaming state that can't be
+# shared) aren't included — see RECOGNITION_QUALITY.md / MODEL_SHARING.md.
+_VOSK_MODEL_LOCK = threading.Lock()
+_VOSK_MODEL_CACHE: dict[str, dict] = {}  # model_path -> {"model": Model, "refcount": int}
 
 
-def close_session(session_hash: str):
+def _acquire_vosk_model(model_path: str) -> Model:
+    with _VOSK_MODEL_LOCK:
+        entry = _VOSK_MODEL_CACHE.get(model_path)
+        if entry is None:
+            print(f"[VOSK] Loading model '{model_path}' (first session to use it)")
+            entry = {"model": Model(model_path), "refcount": 0}
+            _VOSK_MODEL_CACHE[model_path] = entry
+        entry["refcount"] += 1
+        print(
+            f"[VOSK] '{model_path}' now shared by {entry['refcount']} session(s)"
+        )
+        return entry["model"]
+
+
+def _release_vosk_model(model_path: str | None):
+    if not model_path:
+        return
+    with _VOSK_MODEL_LOCK:
+        entry = _VOSK_MODEL_CACHE.get(model_path)
+        if entry is None:
+            return
+        entry["refcount"] -= 1
+        if entry["refcount"] <= 0:
+            print(f"[VOSK] Unloading '{model_path}' — no sessions using it anymore")
+            del _VOSK_MODEL_CACHE[model_path]
+            # The cache's reference to entry["model"] is gone; once this
+            # session's own self.model reference is cleared too (right after
+            # this call, in _unload_vosk), nothing references the underlying
+            # C++ object anymore and it's freed on the next gc.collect().
+        else:
+            print(
+                f"[VOSK] '{model_path}' still shared by {entry['refcount']} "
+                f"other session(s) — not unloading"
+            )
+
+
+def get_or_create_app(slug: str) -> VoiceTranslatorApp:
     with SESSION_LOCK:
-        app = SESSION_APPS.pop(session_hash, None)
+        if slug not in SESSION_APPS:
+            SESSION_APPS[slug] = VoiceTranslatorApp(slug)
+            print(f"[NEW SESSION] {slug} | Total: {len(SESSION_APPS)}")
+        app = SESSION_APPS[slug]
+    app.touch()
+    return app
+
+
+def close_session(slug: str):
+    with SESSION_LOCK:
+        app = SESSION_APPS.pop(slug, None)
     if app:
         app.close()
+
+
+# ── Idle session reaper (OFF by default) ────────────────────────────────────
+# Sessions are permanent: nothing in this app ever tears down a session
+# automatically. is_running/is_monitoring sessions are never touched here no
+# matter how long they run or how much silence there is — silence is handled
+# by the VAD producing no segments, not by touching the session. This reaper
+# only ever considers sessions that are STOPPED (recognition off) and, even
+# then, only if you explicitly opt in via IDLE_SESSION_TIMEOUT_SECONDS — set
+# to 0 (default), it's fully disabled. Set a value only if you specifically
+# want stopped-and-abandoned sessions to free their in-memory app object
+# after N idle seconds (their settings.json is untouched either way).
+IDLE_SESSION_TIMEOUT_SECONDS = int(os.environ.get("IDLE_SESSION_TIMEOUT_SECONDS", "0"))
+_IDLE_REAPER_INTERVAL_SECONDS = 300
+
+
+def _idle_reaper_loop():
+    if IDLE_SESSION_TIMEOUT_SECONDS <= 0:
+        return  # disabled — sessions live forever until explicitly closed
+    while True:
+        time.sleep(_IDLE_REAPER_INTERVAL_SECONDS)
+        now = time.time()
+        stale = []
+        with SESSION_LOCK:
+            for slug, app in SESSION_APPS.items():
+                if app.is_running or app.is_monitoring:
+                    continue  # never reap an actively-listening session
+                if now - app.last_active > IDLE_SESSION_TIMEOUT_SECONDS:
+                    stale.append(slug)
+        for slug in stale:
+            print(
+                f"[IDLE REAPER] Closing '{slug}' after "
+                f"{IDLE_SESSION_TIMEOUT_SECONDS}s stopped + idle"
+            )
+            close_session(slug)
+
+
+threading.Thread(target=_idle_reaper_loop, daemon=True).start()
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -2385,6 +1548,23 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 browser_session_data = gr.HTML(visible=True)
             with gr.Column(scale=1):
                 with gr.Group():
+                    gr.Markdown(
+                        "Visiting this site with no name gives you the **main** "
+                        "session, always the same one. Open or create a separate, "
+                        "independently-configured session below.",
+                        elem_id="session-switcher-hint",
+                    )
+                    with gr.Row():
+                        new_session_name = gr.Textbox(
+                            label="Open or create a session by name",
+                            placeholder="e.g. khyretos",
+                            scale=3,
+                        )
+                        open_session_btn = gr.Button("↗️ Go", scale=1, size="sm")
+                        random_session_btn = gr.Button(
+                            "🎲 New", scale=1, size="sm",
+                            elem_id="random-session-btn",
+                        )
                     session_dropdown = gr.Dropdown(
                         label="Manage Sessions",
                         choices=[],
@@ -2523,19 +1703,37 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 # Audio
                 with gr.Accordion("🎙️ Audio", open=True):
                     audio_mode = gr.Radio(
-                        ["hardware", "browser"],
+                        [
+                            ("Server Audio Device", "hardware"),
+                            ("Browser Microphone", "browser_mic"),
+                            ("Browser Tab / System Audio", "browser_display"),
+                        ],
                         value="hardware",
-                        label="Audio Mode",
-                        info="Browser: Web Audio API via WebSocket | Hardware: System microphone",
+                        label="Audio Source",
+                        info=(
+                            "Server Device: any input on the host — including a virtual/"
+                            "loopback device if you route another app's output through one "
+                            "(see AUDIO_SOURCES.md, e.g. for Discord's desktop app) | "
+                            "Browser Microphone: this device's mic | Browser Tab/System Audio: "
+                            "share a tab or your screen with 'share audio' checked (e.g. "
+                            "Discord in a browser tab, or Windows/ChromeOS system audio)"
+                        ),
                     )
 
                     with gr.Group(visible=True) as hardware_group:
                         microphones = get_microphones()
                         mic_dropdown = gr.Dropdown(
                             choices=microphones,
-                            label="Microphone",
+                            label="Input Device",
                             value=microphones[0][1] if microphones else None,
                             interactive=True,
+                            info=(
+                                "Lists every input-capable device the server can see — "
+                                "physical mics AND any virtual/loopback device configured "
+                                "on the host (e.g. a PulseAudio monitor source or VB-Audio "
+                                "Cable). See AUDIO_SOURCES.md to route another app's audio "
+                                "into one of those."
+                            ),
                         )
                         with gr.Row():
                             refresh_mic_btn = gr.Button("🔄 Refresh", size="sm")
@@ -2554,6 +1752,9 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                         )
 
                     with gr.Group(visible=False) as browser_group:
+                        browser_source_hint = gr.Markdown(
+                            "Uses this device's microphone.", visible=True
+                        )
                         browser_status = gr.Textbox(
                             label="Browser Stream Status",
                             value="Not started",
@@ -2590,11 +1791,16 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                         vad_end_silence_ms = gr.Slider(
                             minimum=0,
                             maximum=2000,
-                            value=80,
+                            value=300,
                             step=50,
                             label="End-of-speech pause (ms)",
-                            info="How long silence must last before a segment is sent. "
-                            "Raise to 500–800 ms if Whisper cuts off mid-sentence.",
+                            info="How long silence must last before a segment is sent to "
+                            "Whisper/Moonshine. Default raised from 80ms → 300ms: 80ms is "
+                            "shorter than a normal mid-sentence breath, so it was fragmenting "
+                            "speech into tiny clips — and very short/ambiguous clips are "
+                            "exactly what triggers Whisper to hallucinate fillers like "
+                            "'thank you'. Raise further (500–800ms) if it's still cutting "
+                            "off mid-sentence; lower it if replies feel laggy.",
                         )
                     # After vad_end_silence_ms slider, add:
                     with gr.Group():
@@ -2673,7 +1879,12 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
 
                         with gr.Group(visible=False) as ai_settings:
                             ai_host = gr.Textbox(
-                                label="API Host", value="http://localhost:11434/v1"
+                                label="API Host",
+                                value="http://localhost:11434",
+                                info="Base host only — the /v1/chat/completions path is "
+                                "added automatically. Was hardcoded to guess a "
+                                "'/v3/...' path here before, which isn't a real endpoint "
+                                "on any standard OpenAI-compatible server; fixed to /v1.",
                             )
                             ai_api_key = gr.Textbox(
                                 label="API Key",
@@ -2681,6 +1892,47 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                                 placeholder="Leave empty for Ollama",
                             )
                             ai_model = gr.Textbox(label="Model", value="llama3.2")
+
+                            with gr.Accordion(
+                                "🛠️ Advanced: custom prompt & request shape (developer)",
+                                open=False,
+                            ):
+                                gr.Markdown(
+                                    "Full details and examples in **AI_TRANSLATION.md**. "
+                                    "Leave any of these blank to use the sensible "
+                                    "OpenAI/Ollama-compatible default."
+                                )
+                                ai_translation_prompt_template = gr.Textbox(
+                                    label="Prompt template",
+                                    lines=3,
+                                    placeholder=tmod.DEFAULT_AI_PROMPT_TEMPLATE,
+                                    info="Placeholders: {source_lang} {target_lang} {text}",
+                                )
+                                ai_endpoint_url = gr.Textbox(
+                                    label="Full endpoint URL override",
+                                    placeholder="e.g. https://api.example.com/v1/chat/completions",
+                                    info="If set, used exactly as-is instead of deriving "
+                                    "from API Host above — for APIs whose chat-completion "
+                                    "path isn't /v1/chat/completions at all.",
+                                )
+                                ai_request_body_template = gr.Textbox(
+                                    label="Request body template (JSON)",
+                                    lines=8,
+                                    placeholder=tmod.DEFAULT_AI_REQUEST_BODY_TEMPLATE,
+                                    info="__MODEL__ and __PROMPT__ are substituted as "
+                                    "JSON-escaped string content. Use this to match a "
+                                    "non-OpenAI-compatible request shape entirely.",
+                                )
+                                ai_response_text_path = gr.Textbox(
+                                    label="Response text path",
+                                    placeholder=tmod.DEFAULT_AI_RESPONSE_TEXT_PATH,
+                                    info="Dot-path to the translated text in the JSON "
+                                    "response, e.g. 'choices.0.message.content' or "
+                                    "'result.translation'. Numeric segments index lists.",
+                                )
+                                ai_advanced_reset_btn = gr.Button(
+                                    "Reset these 4 fields to default", size="sm"
+                                )
 
                         with gr.Group(visible=False) as libretranslate_settings:
                             libretranslate_host = gr.Textbox(
@@ -2915,10 +2167,10 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             """Return a function that sets app.settings[key] = value (and persists)."""
 
             def updater(value, request: gr.Request):
-                app = get_or_create_app(request.session_hash)
+                app = get_or_create_app(get_slug(request))
                 app.settings[key] = value
                 if persist:
-                    persist_settings(app.settings)
+                    persist_settings(app.slug, app.settings)
 
             return updater
 
@@ -2926,10 +2178,10 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             """Set VAD setting AND push to running VAD immediately."""
 
             def updater(value, request: gr.Request):
-                app = get_or_create_app(request.session_hash)
+                app = get_or_create_app(get_slug(request))
                 app.settings[key] = value
                 app.apply_vad_settings()
-                persist_settings(app.settings)
+                persist_settings(app.slug, app.settings)
 
             return updater
 
@@ -2937,31 +2189,31 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             """Set subtitle setting AND apply to SubtitleManager immediately."""
 
             def updater(value, request: gr.Request):
-                app = get_or_create_app(request.session_hash)
+                app = get_or_create_app(get_slug(request))
                 app.settings[key] = value
                 app.apply_subtitle_settings()
-                persist_settings(app.settings)
+                persist_settings(app.slug, app.settings)
 
             return updater
 
         def _set_fade(value, request: gr.Request):
             """Fade timeout applies to both settings and subtitle manager."""
-            app = get_or_create_app(request.session_hash)
+            app = get_or_create_app(get_slug(request))
             app.settings["fade_timeout"] = value
             app.apply_subtitle_settings()
-            persist_settings(app.settings)
+            persist_settings(app.slug, app.settings)
 
         # Subtitle mode toggle
         def update_subtitle_mode(mode, request: gr.Request):
-            app = get_or_create_app(request.session_hash)
+            app = get_or_create_app(get_slug(request))
             app.settings["subtitle_mode"] = mode
             app.apply_subtitle_settings()
-            persist_settings(app.settings)
+            persist_settings(app.slug, app.settings)
             return gr.update(visible=(mode == "buffered"))
 
         # Mic test handlers
         def start_mic_test(request: gr.Request):
-            app = get_or_create_app(request.session_hash)
+            app = get_or_create_app(get_slug(request))
             msg = app.start_mic_monitor()
             return (
                 msg,
@@ -2971,7 +2223,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             )
 
         def stop_mic_test(request: gr.Request):
-            app = get_or_create_app(request.session_hash)
+            app = get_or_create_app(get_slug(request))
             app.stop_mic_monitor()
             return (
                 "",
@@ -2987,9 +2239,9 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             return "", gr.update(visible=False), gr.update(visible=True)
 
         def update_recognition_engine(engine, request: gr.Request):
-            app = get_or_create_app(request.session_hash)
+            app = get_or_create_app(get_slug(request))
             app.settings["recognition_engine"] = engine
-            persist_settings(app.settings)
+            persist_settings(app.slug, app.settings)
             return {
                 vosk_settings: gr.update(visible=(engine == "vosk")),
                 whisper_settings: gr.update(visible=(engine == "whisper")),
@@ -2997,18 +2249,32 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             }
 
         def update_audio_mode(mode, request: gr.Request):
-            app = get_or_create_app(request.session_hash)
+            app = get_or_create_app(get_slug(request))
             app.settings["audio_mode"] = mode
-            persist_settings(app.settings)
+            persist_settings(app.slug, app.settings)
+            if mode == "browser_display":
+                hint = (
+                    "**Tab/System Audio**: pressing Start (or Test Mic) will ask "
+                    "your browser to pick a tab, window, or screen — check **'Share "
+                    "audio'** in that picker. What actually gets captured (just that "
+                    "tab vs. the whole system) depends on your browser/OS — see "
+                    "AUDIO_SOURCES.md. This is how to translate e.g. a Discord *web* "
+                    "tab, or (Windows/ChromeOS) whole-system audio."
+                )
+            else:
+                hint = "Uses this device's microphone."
             return {
                 hardware_group: gr.update(visible=(mode == "hardware")),
-                browser_group: gr.update(visible=(mode == "browser")),
+                browser_group: gr.update(
+                    visible=(mode in ("browser_mic", "browser_display"))
+                ),
+                browser_source_hint: gr.update(value=hint),
             }
 
         def update_translation_mode(mode, request: gr.Request):
-            app = get_or_create_app(request.session_hash)
+            app = get_or_create_app(get_slug(request))
             app.settings["translation_mode"] = mode
-            persist_settings(app.settings)
+            persist_settings(app.slug, app.settings)
             return {
                 ai_settings: gr.update(visible=(mode == "ai")),
                 libretranslate_settings: gr.update(visible=(mode == "libretranslate")),
@@ -3019,25 +2285,25 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             }
 
         def update_translation_toggle(enabled, request: gr.Request):
-            app = get_or_create_app(request.session_hash)
+            app = get_or_create_app(get_slug(request))
             app.settings["enable_translation"] = enabled
             if not enabled:
                 app.subtitles._cur_trans = ""
-            persist_settings(app.settings)
+            persist_settings(app.slug, app.settings)
             return gr.update(visible=enabled)
 
         def update_font_selector(value, request: gr.Request):
-            app = get_or_create_app(request.session_hash)
+            app = get_or_create_app(get_slug(request))
             custom_fonts = [f[1] for f in get_available_fonts()]
             if value in custom_fonts:
                 app.settings["custom_font"] = value
             else:
                 app.settings["font_family"] = value
                 app.settings["custom_font"] = ""
-            persist_settings(app.settings)
+            persist_settings(app.slug, app.settings)
 
         def update_custom_popout_id(value, request: gr.Request):
-            app = get_or_create_app(request.session_hash)
+            app = get_or_create_app(get_slug(request))
             if value and value.strip():
                 sanitized = re.sub(r"[^a-zA-Z0-9_-]", "", value.strip())
                 app.popout_id = sanitized if sanitized else secrets.token_urlsafe(16)
@@ -3049,7 +2315,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             )
 
         def generate_random_popout(value, request: gr.Request):
-            app = get_or_create_app(request.session_hash)
+            app = get_or_create_app(get_slug(request))
             app.popout_id = secrets.token_urlsafe(16)
             return (
                 f"http://{args.host}:{args.port}/popout/{app.popout_id}",
@@ -3057,7 +2323,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             )
 
         def test_whisper_connection(request: gr.Request):
-            app = get_or_create_app(request.session_hash)
+            app = get_or_create_app(get_slug(request))
             host = app.settings["whisper_host"]
             if not host:
                 return "❌ Please enter a Whisper API host URL"
@@ -3084,7 +2350,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 return f"❌ Error: {exc}"
 
         def refresh_sessions_list(request: gr.Request):
-            current = request.session_hash
+            current = get_slug(request)
             try:
                 r = requests.get(
                     f"http://{args.host}:{args.port}/active_sessions", timeout=2
@@ -3092,12 +2358,12 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 if r.status_code == 200:
                     sessions = r.json().get("sessions", [])
                     choices = [("All sessions", "ALL")] + [
-                        (s[:8], s) for s in sessions if s != current
+                        (s, s) for s in sessions if s != current
                     ]
                     return (
                         gr.update(choices=choices, value=None),
                         gr.update(
-                            value=f"### 🎯 Session: `{current[:8]}` | Active: {len(sessions)}"
+                            value=f"### 🎯 Session: `{current}` | Active: {len(sessions)}"
                         ),
                     )
             except Exception:
@@ -3105,7 +2371,7 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             return gr.update(choices=[]), gr.update()
 
         def close_session_action(selected, request: gr.Request):
-            current = request.session_hash
+            current = get_slug(request)
             if not selected:
                 return "No session selected", gr.update()
             if selected == "ALL":
@@ -3123,13 +2389,13 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                         a.deactivate_session()
                         del SESSION_APPS[selected]
                 total = len(SESSION_APPS)
-                msg = f"Session {selected[:8]} closed"
+                msg = f"Session {selected} closed"
             return msg, gr.update(
-                value=f"### 🎯 Session: `{current[:8]}` | Active: {total}"
+                value=f"### 🎯 Session: `{current}` | Active: {total}"
             )
 
         def start_rec(request: gr.Request):
-            app = get_or_create_app(request.session_hash)
+            app = get_or_create_app(get_slug(request))
             model = (
                 app.settings["vosk_model"]
                 if app.settings["recognition_engine"] == "vosk"
@@ -3138,19 +2404,30 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             return app.start_recognition(model, app.settings.get("microphone"))
 
         def stop_rec(request: gr.Request):
-            return get_or_create_app(request.session_hash).stop_recognition()
+            return get_or_create_app(get_slug(request)).stop_recognition()
 
         def update_display(request: gr.Request):
-            return get_or_create_app(request.session_hash).get_current_display()
+            return get_or_create_app(get_slug(request)).get_current_display()
 
         def update_logs(request: gr.Request):
-            return get_or_create_app(request.session_hash).update_logs()
+            return get_or_create_app(get_slug(request)).update_logs()
 
         def cleanup_user_data(request: gr.Request):
-            close_session(request.session_hash)
+            # Tabs closing / reloading no longer destroys the session — a
+            # session now lives until the user explicitly closes it (via the
+            # "Manage Sessions" dropdown) or the idle reaper reclaims it after
+            # IDLE_SESSION_TIMEOUT_SECONDS of inactivity with nothing running.
+            # This is what makes a reload/reconnect re-attach cleanly instead
+            # of losing state — which is also what fixed the "sometimes it
+            # just refreshes" symptom: it used to tear the whole session down.
+            slug = get_slug(request)
+            app = SESSION_APPS.get(slug)
+            if app:
+                app.touch()
 
         def handle_ui_load(request: gr.Request):
-            app = get_or_create_app(request.session_hash)
+            slug = get_slug(request)
+            app = get_or_create_app(slug)
 
             # Ensure microphone and model are set to valid values
             models = get_available_models()
@@ -3163,14 +2440,14 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             s = app.settings
             font_value = s.get("custom_font") or s["font_family"]
             session_html = (
-                f'<div id="session-data" data-session="{request.session_hash}" '
-                f'data-ws-path="/ws/{request.session_hash}" '
+                f'<div id="session-data" data-session="{slug}" '
+                f'data-ws-path="/ws/{slug}" '
                 f'data-popout="{app.popout_id}">'
-                f"<b>Each tab = separate session • Refresh = new session</b></div>"
+                f"<b>Session: {slug} — bookmark this URL to return to it</b></div>"
             )
 
             return {
-                session_info: f"### 🎯 Session: `{request.session_hash[:8]}` | Active: {len(SESSION_APPS)}",
+                session_info: f"### 🎯 Session: `{slug}` | Active: {len(SESSION_APPS)}",
                 popout_url: f"http://{args.host}:{args.port}/popout/{app.popout_id}",
                 vosk_model_dropdown: s["vosk_model"],
                 mic_dropdown: s.get("microphone"),
@@ -3244,6 +2521,10 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 ai_host: s["ai_host"],
                 ai_api_key: s["ai_api_key"],
                 ai_model: s["ai_model"],
+                ai_translation_prompt_template: s["ai_translation_prompt_template"],
+                ai_endpoint_url: s["ai_endpoint_url"],
+                ai_request_body_template: s["ai_request_body_template"],
+                ai_response_text_path: s["ai_response_text_path"],
                 outline_width: s["outline_width"],
                 outline_color: s["outline_color"],
                 translated_outline_width: s["translated_outline_width"],
@@ -3263,13 +2544,13 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             }
 
         def reset_to_defaults(request: gr.Request):
-            app = get_or_create_app(request.session_hash)
-            # Overwrite with defaults, but keep session_hash, popout_id, etc. – those are not in DEFAULT_SETTINGS
+            app = get_or_create_app(get_slug(request))
+            # Overwrite with defaults, but keep slug, popout_id, etc. – those are not in DEFAULT_SETTINGS
             app.settings.update(VoiceTranslatorApp.DEFAULT_SETTINGS)
             # Also update subtitle manager and VAD with the new values
             app.apply_subtitle_settings()
             app.apply_vad_settings()
-            persist_settings(app.settings)
+            persist_settings(app.slug, app.settings)
 
             # Build the same output dictionary as handle_ui_load
             s = app.settings
@@ -3346,6 +2627,10 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 ai_host: s["ai_host"],
                 ai_api_key: s["ai_api_key"],
                 ai_model: s["ai_model"],
+                ai_translation_prompt_template: s["ai_translation_prompt_template"],
+                ai_endpoint_url: s["ai_endpoint_url"],
+                ai_request_body_template: s["ai_request_body_template"],
+                ai_response_text_path: s["ai_response_text_path"],
                 outline_width: s["outline_width"],
                 outline_color: s["outline_color"],
                 translated_outline_width: s["translated_outline_width"],
@@ -3368,7 +2653,9 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             [vosk_settings, whisper_settings, moonshine_settings],
         )
         audio_mode.change(
-            update_audio_mode, [audio_mode], [hardware_group, browser_group]
+            update_audio_mode,
+            [audio_mode],
+            [hardware_group, browser_group, browser_source_hint],
         )
         translation_mode.change(
             update_translation_mode,
@@ -3395,6 +2682,38 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         ai_host.change(_set("ai_host"), [ai_host])
         ai_api_key.change(_set("ai_api_key"), [ai_api_key])
         ai_model.change(_set("ai_model"), [ai_model])
+        ai_translation_prompt_template.change(
+            _set("ai_translation_prompt_template"), [ai_translation_prompt_template]
+        )
+        ai_endpoint_url.change(_set("ai_endpoint_url"), [ai_endpoint_url])
+        ai_request_body_template.change(
+            _set("ai_request_body_template"), [ai_request_body_template]
+        )
+        ai_response_text_path.change(
+            _set("ai_response_text_path"), [ai_response_text_path]
+        )
+
+        def reset_ai_advanced(request: gr.Request):
+            app = get_or_create_app(get_slug(request))
+            for key in (
+                "ai_translation_prompt_template",
+                "ai_endpoint_url",
+                "ai_request_body_template",
+                "ai_response_text_path",
+            ):
+                app.settings[key] = ""
+            persist_settings(app.slug, app.settings)
+            return "", "", "", ""
+
+        ai_advanced_reset_btn.click(
+            reset_ai_advanced,
+            outputs=[
+                ai_translation_prompt_template,
+                ai_endpoint_url,
+                ai_request_body_template,
+                ai_response_text_path,
+            ],
+        )
         libretranslate_host.change(_set("libretranslate_host"), [libretranslate_host])
         libretranslate_api_key.change(
             _set("libretranslate_api_key"), [libretranslate_api_key]
@@ -3571,6 +2890,31 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         )
 
         # Session management
+        _OPEN_SESSION_JS = """
+        (name) => {
+            name = (name || "").trim();
+            if (!name) return;
+            const clean = name.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
+            if (!clean) {
+                alert("Session name can only contain letters, numbers, - and _");
+                return;
+            }
+            window.location.href = "/?session=" + encodeURIComponent(clean);
+        }
+        """
+        open_session_btn.click(fn=None, inputs=[new_session_name], js=_OPEN_SESSION_JS)
+        new_session_name.submit(
+            fn=None, inputs=[new_session_name], js=_OPEN_SESSION_JS
+        )
+        random_session_btn.click(
+            fn=None,
+            js="""
+            () => {
+                const rand = Math.random().toString(36).slice(2, 10);
+                window.location.href = "/?session=" + rand;
+            }
+            """,
+        )
         refresh_sessions_btn.click(
             refresh_sessions_list, outputs=[session_dropdown, session_info]
         )
@@ -3667,6 +3011,10 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 ai_host,
                 ai_api_key,
                 ai_model,
+                ai_translation_prompt_template,
+                ai_endpoint_url,
+                ai_request_body_template,
+                ai_response_text_path,
                 outline_width,
                 outline_color,
                 translated_outline_width,
@@ -3751,6 +3099,10 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 ai_host,
                 ai_api_key,
                 ai_model,
+                ai_translation_prompt_template,
+                ai_endpoint_url,
+                ai_request_body_template,
+                ai_response_text_path,
                 outline_width,
                 outline_color,
                 translated_outline_width,
@@ -3827,33 +3179,36 @@ if __name__ == "__main__":
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # Resolves the persistent session slug (see top of file) and pins it to
+    # the browser via a cookie. Must be added before mount_gradio_app below.
+    fastapi_app.add_middleware(SessionSlugMiddleware)
 
-    @fastapi_app.get("/mic_level/{session_hash}")
-    async def get_mic_level(session_hash: str):
+    @fastapi_app.get("/mic_level/{slug}")
+    async def get_mic_level(slug: str):
         with SESSION_LOCK:
-            app = SESSION_APPS.get(session_hash)
+            app = SESSION_APPS.get(slug)
         if app:
             return JSONResponse({"rms": app.monitor_level})
         return JSONResponse({"rms": 0.0})
 
-    @fastapi_app.get("/display_data/{session_hash}")
-    async def get_display_data(session_hash: str):
+    @fastapi_app.get("/display_data/{slug}")
+    async def get_display_data(slug: str):
         """
         Polled directly by JS every 50 ms — completely bypasses Gradio's SSE queue.
         This is what makes the display update without ever triggering a page reload.
         """
         with SESSION_LOCK:
-            app = SESSION_APPS.get(session_hash)
+            app = SESSION_APPS.get(slug)
         if app:
             html, rec, trans = app.get_current_display()
             return JSONResponse({"html": html, "recognized": rec, "translated": trans})
         return JSONResponse({"html": "", "recognized": "", "translated": ""})
 
-    @fastapi_app.get("/logs_data/{session_hash}")
-    async def get_logs_data(session_hash: str):
+    @fastapi_app.get("/logs_data/{slug}")
+    async def get_logs_data(slug: str):
         """Polled by JS every 2 s — serves log text without using Gradio SSE."""
         with SESSION_LOCK:
-            app = SESSION_APPS.get(session_hash)
+            app = SESSION_APPS.get(slug)
         if app:
             return JSONResponse({"logs": app.update_logs()})
         return JSONResponse({"logs": ""})
@@ -3863,34 +3218,41 @@ if __name__ == "__main__":
         with SESSION_LOCK:
             return JSONResponse({"sessions": list(SESSION_APPS.keys())})
 
-    @fastapi_app.post("/deactivate/{session_hash}")
-    async def deactivate_session(session_hash: str):
+    @fastapi_app.post("/deactivate/{slug}")
+    async def deactivate_session(slug: str):
+        """
+        Explicit, manual full teardown of a session (stops recognition, frees
+        models). Not called automatically on tab close/reload anymore — use
+        the "Manage Sessions" panel in the UI, or call this directly, when you
+        actually want to free a session's resources.
+        """
         with SESSION_LOCK:
-            app = SESSION_APPS.get(session_hash)
+            app = SESSION_APPS.get(slug)
             if app:
                 app.deactivate_session()
-                del SESSION_APPS[session_hash]
+                del SESSION_APPS[slug]
                 return JSONResponse({"status": "deactivated"})
         return JSONResponse({"status": "not found"}, status_code=404)
 
-    @fastapi_app.websocket("/ws/{session_hash}")
-    async def websocket_endpoint(websocket: WebSocket, session_hash: str):
+    @fastapi_app.websocket("/ws/{slug}")
+    async def websocket_endpoint(websocket: WebSocket, slug: str):
         await websocket.accept()
-        with SESSION_LOCK:
-            app = SESSION_APPS.get(session_hash)
-        if not app:
-            await websocket.close(code=1008, reason="Session not found")
-            return
+        app = get_or_create_app(slug)
         try:
             while True:
                 msg = await websocket.receive()
                 if msg["type"] == "websocket.receive" and "bytes" in msg:
                     app.audio_queue.put(msg["bytes"])
+                    app.touch()
         except WebSocketDisconnect:
-            close_session(session_hash)
+            # A dropped browser-audio stream (tab closed, "stop streaming"
+            # clicked, network blip) no longer tears the session down — it
+            # just stops feeding audio in. The session (models, settings,
+            # any hardware-mic recognition) stays alive until the user
+            # explicitly closes it or the idle reaper reclaims it.
+            pass
         except Exception as exc:
-            print(f"WebSocket error [{session_hash[:8]}]: {exc}")
-            close_session(session_hash)
+            print(f"WebSocket error [{slug}]: {exc}")
 
     @fastapi_app.get("/popout/{popout_id}")
     async def get_popout(popout_id: str):
@@ -3937,8 +3299,9 @@ if __name__ == "__main__":
 ║          🎤 Voice Translator - Multi-Session                 ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  URL: http://{args.host}:{args.port}                                  ║
+║  Named session: http://{args.host}:{args.port}/?session=<name>        ║
 ║                                                              ║
-║  ✅ Settings persisted to {str(SETTINGS_FILE):<34}║
+║  ✅ Per-session settings saved under {str(SETTINGS_DIR):<24}║
 ║  🎚️  VAD default: 50 ms silence timeout (all engines)      ║
 ║  ⏹️  Stop unloads models, settings preserved               ║
 ║  🌙 Moonshine: auto-download from HuggingFace               ║
@@ -3950,7 +3313,14 @@ if __name__ == "__main__":
         host=args.host,
         port=args.port,
         log_config=LOG_CONFIG,
-        timeout_keep_alive=0,  # 1 hour — never drop an idle SSE/WS connection
+        # NOTE: this was previously `0`, which tells uvicorn to close the
+        # keep-alive connection almost immediately after each response
+        # instead of the "1 hour" the comment claimed. That was very likely
+        # the main cause of "sessions randomly refresh" — Gradio's own SSE
+        # queue connection (and any long HTTP polling) got dropped every few
+        # seconds, forcing the frontend to reconnect. 3600s = 1 hour, as the
+        # comment always intended.
+        timeout_keep_alive=3600,  # never drop an idle SSE/WS connection
         ws_ping_interval=30,  # keep WebSocket alive with pings every 30 s
         ws_ping_timeout=120,  # give 2 minutes to respond before dropping
     )

@@ -4,17 +4,31 @@ services:
   voice-translator:
     build: .
     container_name: voice-translator
-    ports:
-      - "7860:7860"
+    #    ports:
+    #      - "7860:7860"
     volumes:
       - ./vosk_models:/app/vosk_models
       - ./argos_models:/app/argos_models
       - ./moonshine_models:/app/moonshine_models
       - ./fonts:/app/fonts
       - ./logs:/app/logs
+      - ./settings:/app/settings # per-session settings — was NOT mounted before, so settings.json was silently lost on every container restart/rebuild
     devices:
       - /dev/snd:/dev/snd # For audio access
     environment:
       - GRADIO_SERVER_NAME=0.0.0.0
       - GRADIO_SERVER_PORT=7860
+      # Sessions are permanent by default — nothing auto-closes an
+      # actively-listening session, ever, regardless of silence duration.
+      # This only controls whether *stopped* sessions left idle get their
+      # in-memory state freed (settings.json is never touched either way).
+      # 0 = disabled (default). Uncomment to opt in, e.g. 6h:
+      # - IDLE_SESSION_TIMEOUT_SECONDS=21600
     restart: unless-stopped
+    networks:
+      - outside
+
+networks:
+  outside:
+    external: true
+    name: nginx-reverse-proxy_default

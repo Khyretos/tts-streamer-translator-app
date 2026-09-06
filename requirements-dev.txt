@@ -1,0 +1,5 @@
+# Dev/test-only dependencies — not installed in the Docker image, so the
+# production container stays lean. Install locally with:
+#   pip install -r requirements.txt -r requirements-dev.txt
+-r requirements.txt
+pytest>=8.0

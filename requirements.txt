@@ -1,23 +1,23 @@
 # Core web UI and server
-gradio>=4.44.0
+gradio
 
 # Speech recognition
-vosk>=0.3.45
-sounddevice>=0.4.7
-moonshine-voice>=0.1.0          # ONNX‑based local ASR (auto‑downloads models)
+vosk
+sounddevice
+moonshine-voice                  # ONNX‑based local ASR (auto‑downloads models)
 
 # Audio & VAD
 webrtcvad                        # Voice Activity Detection (requires compiler)
-cffi>=1.15.0                     # Required by webrtcvad
+cffi                             # Required by webrtcvad
 
 # Data & numeric processing
-numpy>=1.26.0,<2.0.0
+numpy
 
 # HTTP requests (Whisper API, translation backends)
 requests>=2.31.0
 
 # Translation backends
-translators>=5.9.1               # Google Translate, etc. (online)
+translators                       # Google Translate, etc. (online)
 argostranslate                   # Offline translation (Argos)
 tokenizers                       # Used by some HuggingFace models
 huggingface_hub                  # For model downloads (Moonshine, etc.)
