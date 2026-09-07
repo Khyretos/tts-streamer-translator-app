@@ -32,6 +32,40 @@ class TestLoadSavedSettings:
         result = ss.load_saved_settings("bob")
         assert result == {"vosk_model": "legacy-en"}
 
+    def test_seeds_new_slug_from_main_session_over_legacy_file(self):
+        # main's *current* settings take priority over the old legacy file
+        # once main itself has a settings file — a new named session should
+        # inherit from what main is configured with right now, not a stale
+        # pre-named-sessions snapshot.
+        ss.SETTINGS_FILE.write_text(json.dumps({"vosk_model": "legacy-en"}))
+        ss.SETTINGS_DIR.mkdir(parents=True)
+        (ss.SETTINGS_DIR / "main.json").write_text(json.dumps({"vosk_model": "main-current"}))
+        result = ss.load_saved_settings("brand-new-session")
+        assert result == {"vosk_model": "main-current"}
+
+    def test_main_itself_does_not_seed_from_itself(self):
+        # main.json doesn't exist yet — loading "main" must not try to seed
+        # from "main" (infinite-loop-shaped edge case) and should fall
+        # through to the legacy file / empty dict instead.
+        ss.SETTINGS_FILE.write_text(json.dumps({"vosk_model": "legacy-en"}))
+        result = ss.load_saved_settings("main")
+        assert result == {"vosk_model": "legacy-en"}
+
+    def test_new_session_diverges_independently_after_first_save(self):
+        ss.SETTINGS_DIR.mkdir(parents=True)
+        (ss.SETTINGS_DIR / "main.json").write_text(json.dumps({"vosk_model": "main-v1"}))
+        # New session seeds from main...
+        seeded = ss.load_saved_settings("khyretos")
+        assert seeded == {"vosk_model": "main-v1"}
+        # ...but once it's saved, it's independent — a later change to main
+        # must not retroactively affect it.
+        ss.persist_settings("khyretos", {"vosk_model": "khyretos-v1", "recognition_engine": "vosk"})
+        import time as _time
+        _time.sleep(1.3)
+        (ss.SETTINGS_DIR / "main.json").write_text(json.dumps({"vosk_model": "main-v2"}))
+        reloaded = ss.load_saved_settings("khyretos")
+        assert reloaded["vosk_model"] == "khyretos-v1"
+
     def test_own_slug_file_takes_priority_over_legacy(self):
         ss.SETTINGS_FILE.write_text(json.dumps({"vosk_model": "legacy-en"}))
         ss.SETTINGS_DIR.mkdir(parents=True)

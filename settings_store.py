@@ -7,7 +7,7 @@ import json
 import threading
 from pathlib import Path
 
-from session import sanitize_slug
+from session import DEFAULT_SLUG, sanitize_slug
 
 SETTINGS_DIR = Path("settings")
 SETTINGS_FILE = Path("settings.json")  # legacy single-file location (pre-slugs)
@@ -16,6 +16,7 @@ SETTINGS_FILE = Path("settings.json")  # legacy single-file location (pre-slugs)
 PERSISTABLE_KEYS = [
     "audio_mode",
     "recognition_engine",
+    "microphone",
     "vosk_model",
     "enable_translation",
     "display_interim",
@@ -47,6 +48,8 @@ PERSISTABLE_KEYS = [
     "whisper_no_speech_threshold",
     "whisper_logprob_threshold",
     "whisper_compression_ratio_threshold",
+    "whisper_endpoint_url",
+    "whisper_response_text_path",
     "whisper_translate_host",
     "whisper_translate_api_key",
     "whisper_translate_model",
@@ -62,6 +65,8 @@ PERSISTABLE_KEYS = [
     "whisper_translate_no_speech_threshold",
     "whisper_translate_logprob_threshold",
     "whisper_translate_compression_ratio_threshold",
+    "whisper_translate_endpoint_url",
+    "whisper_translate_response_text_path",
     "argos_source_lang",
     "argos_target_lang",
     "libretranslate_host",
@@ -115,12 +120,19 @@ def load_saved_settings(slug: str) -> dict:
     """
     Load persisted settings for this slug. Returns empty dict on failure.
 
-    If this slug has never been saved before, fall back to the legacy
-    single-file settings.json (pre-named-sessions installs) so an existing
-    user's tuned settings carry over into their first named session. Once
-    the slug is saved, it gets its own file and no longer touches the
-    legacy one.
+    If this slug has never been saved before, seed it from the "main"
+    session's *current* settings — so any new named session starts from
+    whatever main is configured with right now, rather than defaults. Once
+    a new session saves its own settings (which happens automatically on
+    the first change), it gets its own file and is independent from then
+    on — main's settings changing afterward doesn't retroactively affect
+    it. "main" itself, or a session slug matching DEFAULT_SLUG, never seeds
+    from itself.
+
+    Falls further back to the legacy single-file settings.json (very old,
+    pre-named-sessions installs) if even main has never been saved yet.
     """
+    slug = sanitize_slug(slug) or DEFAULT_SLUG
     path = _settings_path(slug)
     try:
         if path.exists():
@@ -128,6 +140,18 @@ def load_saved_settings(slug: str) -> dict:
                 data = _migrate_vad_threshold_in_place(json.load(f))
                 print(f"[SETTINGS] Loaded saved settings for '{slug}' from {path}")
                 return data
+
+        if slug != DEFAULT_SLUG:
+            main_path = _settings_path(DEFAULT_SLUG)
+            if main_path.exists():
+                with open(main_path, "r") as f:
+                    data = _migrate_vad_threshold_in_place(json.load(f))
+                    print(
+                        f"[SETTINGS] No settings file for '{slug}' yet — seeding "
+                        f"from the current '{DEFAULT_SLUG}' session's settings"
+                    )
+                    return data
+
         if SETTINGS_FILE.exists():
             with open(SETTINGS_FILE, "r") as f:
                 data = _migrate_vad_threshold_in_place(json.load(f))

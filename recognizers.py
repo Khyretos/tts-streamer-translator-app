@@ -102,10 +102,52 @@ _WHISPER_HALLUCINATIONS: set[str] = {
     "end.",
 }
 
+# Used only for the short-utterance prefix check in is_whisper_hallucination
+# (see below). Split into two tiers: generic openers ("thank you", "bye")
+# are common in real short speech too, so they only count for very short
+# utterances; phrases that are essentially never said in normal
+# conversation ("thanks for watching", "like and subscribe") are safe to
+# match over a longer word count.
+_HALLUCINATION_PREFIXES_GENERIC: tuple[str, ...] = (
+    "thank you",
+    "goodbye",
+    "bye",
+)
+_HALLUCINATION_PREFIXES_DISTINCTIVE: tuple[str, ...] = (
+    "thanks for watching",
+    "thank you for watching",
+    "thank you so much for watching",
+    "like and subscribe",
+    "please subscribe",
+    "subscribe",
+    "see you next time",
+    "see you in the next video",
+)
+
 
 def is_whisper_hallucination(text: str) -> bool:
     """Return True if text is a known Whisper hallucination / filler output."""
-    return text.strip().lower() in _WHISPER_HALLUCINATIONS
+    normalized = text.strip().lower()
+    if normalized in _WHISPER_HALLUCINATIONS:
+        return True
+    # Exact-match alone misses real-world variation ("Thank you for
+    # watching, don't forget to subscribe!" vs. the exact denylist entries).
+    # For SHORT utterances specifically, matching just the opening words is
+    # safe: a genuine sentence that happens to start the same way but keeps
+    # going ("Thank you for the detailed explanation...") is long enough to
+    # skip this check entirely. Hallucinated fillers are almost always
+    # short — that's what makes this a reasonable, conservative widening
+    # rather than a blanket fuzzy match.
+    word_count = len(normalized.split())
+    if word_count <= 4:
+        for prefix in _HALLUCINATION_PREFIXES_GENERIC:
+            if normalized.startswith(prefix):
+                return True
+    if word_count <= 10:
+        for prefix in _HALLUCINATION_PREFIXES_DISTINCTIVE:
+            if normalized.startswith(prefix):
+                return True
+    return False
 
 class ArgosTranslator:
     """Offline translation using Argos Translate."""
@@ -165,6 +207,21 @@ class ArgosTranslator:
             return []
 
 
+def _resolve_response_path(data, path: str):
+    """
+    Walk a dot-separated path through nested dicts/lists, e.g.
+    "result.text" -> data["result"]["text"]. Numeric segments index into
+    lists. Raises on a bad path — callers catch and fall back.
+    """
+    node = data
+    for segment in path.split("."):
+        if isinstance(node, list):
+            node = node[int(segment)]
+        else:
+            node = node[segment]
+    return node
+
+
 # ── Whisper Recognizer ────────────────────────────────────────────────────────
 class WhisperRecognizer:
     """Whisper API-based speech recognizer with configurable parameters."""
@@ -187,6 +244,8 @@ class WhisperRecognizer:
         no_speech_threshold=0.6,
         logprob_threshold=-1.0,
         compression_ratio_threshold=2.4,
+        endpoint_url=None,
+        response_text_path=None,
     ):
         self.host = host.rstrip("/")
         self.api_key = api_key
@@ -207,6 +266,13 @@ class WhisperRecognizer:
         self.no_speech_threshold = no_speech_threshold
         self.logprob_threshold = logprob_threshold
         self.compression_ratio_threshold = compression_ratio_threshold
+        # Advanced/developer overrides for a non-OpenAI-compatible server —
+        # both optional, blank/None means "use the OpenAI-compatible
+        # defaults" (auto-derived endpoint path, verbose_json segment
+        # parsing). See AI_TRANSLATION.md for the equivalent AI-translation
+        # feature this mirrors.
+        self.endpoint_url = (endpoint_url or "").strip() or None
+        self.response_text_path = (response_text_path or "").strip() or None
 
     def _build_data(self, language=None, task="transcribe"):
         data = {
@@ -254,6 +320,21 @@ class WhisperRecognizer:
         """
         if not isinstance(result, dict):
             return str(result)
+        if self.response_text_path:
+            # Custom response shape — can't assume verbose_json segments
+            # exist at all, so skip the confidence-filtering below entirely
+            # and just extract the text at the given path.
+            try:
+                value = _resolve_response_path(result, self.response_text_path)
+                return str(value).strip()
+            except (KeyError, IndexError, TypeError, ValueError) as e:
+                if self.logger:
+                    self.logger.log(
+                        f"Custom Whisper response path '{self.response_text_path}' "
+                        f"didn't resolve ({e}) — falling back to the standard "
+                        f"verbose_json segment parsing.",
+                        level="warning",
+                    )
         segments = result.get("segments")
         if not segments:
             # Server didn't return verbose_json segment data (older/minimal
@@ -302,9 +383,8 @@ class WhisperRecognizer:
             buffer.seek(0)
             files = {"file": ("audio.wav", buffer, "audio/wav")}
             data = self._build_data(language=language, task="transcribe")
-            response = self.session.post(
-                f"{self.host}/audio/transcriptions", files=files, data=data, timeout=30
-            )
+            url = self.endpoint_url or f"{self.host}/audio/transcriptions"
+            response = self.session.post(url, files=files, data=data, timeout=30)
             if response.status_code == 200:
                 return self._extract_text(response.json())
             else:
@@ -330,9 +410,8 @@ class WhisperRecognizer:
             buffer.seek(0)
             files = {"file": ("audio.wav", buffer, "audio/wav")}
             data = self._build_data(task="translate")
-            response = self.session.post(
-                f"{self.host}/audio/translations", files=files, data=data, timeout=30
-            )
+            url = self.endpoint_url or f"{self.host}/audio/translations"
+            response = self.session.post(url, files=files, data=data, timeout=30)
             if response.status_code == 200:
                 return self._extract_text(response.json())
             else:

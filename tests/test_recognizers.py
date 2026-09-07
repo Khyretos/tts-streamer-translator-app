@@ -31,6 +31,9 @@ class TestHallucinationFilter:
             "like and subscribe.",
             "  bye!  ",
             "Um.",
+            "Thanks for watching, don't forget to subscribe!",
+            "Thank you so much for watching this video everyone",
+            "Please subscribe to my newsletter for updates",
         ],
     )
     def test_known_hallucinations_blocked(self, text):
@@ -42,6 +45,7 @@ class TestHallucinationFilter:
             "Thank you for the detailed explanation of quantum mechanics.",
             "I need to go now, bye for now, see you tomorrow.",
             "The weather today is quite nice.",
+            "Thank you Bob, see you tomorrow at the meeting to discuss the budget",
             "",
         ],
     )
@@ -149,6 +153,55 @@ class TestWhisperRecognizerResponseFiltering:
     def test_non_dict_result_is_stringified(self):
         wr = self.make_recognizer()
         assert wr._extract_text("just a string") == "just a string"
+
+
+class TestWhisperEndpointOverride:
+    def test_default_uses_auto_derived_transcribe_path(self):
+        wr = WhisperRecognizer(host="http://x", model="m")
+        assert wr.endpoint_url is None
+
+    def test_explicit_endpoint_override_stored(self):
+        wr = WhisperRecognizer(
+            host="http://x", model="m", endpoint_url="https://api.example.com/v1/asr"
+        )
+        assert wr.endpoint_url == "https://api.example.com/v1/asr"
+
+    def test_blank_endpoint_override_treated_as_unset(self):
+        wr = WhisperRecognizer(host="http://x", model="m", endpoint_url="   ")
+        assert wr.endpoint_url is None
+
+
+class TestWhisperCustomResponsePath:
+    def test_default_uses_verbose_json_segments(self):
+        wr = WhisperRecognizer(host="http://x", model="m")
+        assert wr.response_text_path is None
+        result = {"segments": [{"text": "hello", "no_speech_prob": 0.05,
+                                 "avg_logprob": -0.1, "compression_ratio": 1.2}]}
+        assert wr._extract_text(result) == "hello"
+
+    def test_custom_path_bypasses_segment_filtering(self):
+        wr = WhisperRecognizer(
+            host="http://x", model="m", response_text_path="result.text"
+        )
+        # No segments/confidence data at all in this non-standard shape —
+        # must still work since the custom path skips that logic entirely.
+        result = {"result": {"text": "custom shape works"}}
+        assert wr._extract_text(result) == "custom shape works"
+
+    def test_custom_path_with_list_index(self):
+        wr = WhisperRecognizer(
+            host="http://x", model="m", response_text_path="alternatives.0.transcript"
+        )
+        result = {"alternatives": [{"transcript": "hi there"}]}
+        assert wr._extract_text(result) == "hi there"
+
+    def test_broken_custom_path_falls_back_to_standard_parsing(self):
+        wr = WhisperRecognizer(
+            host="http://x", model="m", response_text_path="totally.wrong.path"
+        )
+        result = {"segments": [{"text": "fallback works", "no_speech_prob": 0.05,
+                                 "avg_logprob": -0.1, "compression_ratio": 1.2}]}
+        assert wr._extract_text(result) == "fallback works"
 
 
 class TestArgosTranslatorUnavailable:

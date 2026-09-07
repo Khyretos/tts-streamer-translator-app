@@ -36,7 +36,12 @@ from recognizers import (
 )
 from vad import FastVAD, _WRTCVAD_AVAILABLE
 from subtitles import SubtitleManager
-from session import SessionSlugMiddleware, get_slug
+from session import (
+    SessionSlugMiddleware,
+    forget_session_hash,
+    get_slug,
+    register_slug,
+)
 from settings_store import SETTINGS_DIR, load_saved_settings, persist_settings
 
 if ARGOS_AVAILABLE:
@@ -477,11 +482,17 @@ class VoiceTranslatorApp:
         "whisper_length_penalty": 1.0,
         "whisper_suppress_tokens": "-1",
         "whisper_initial_prompt": "",
-        "whisper_condition_on_previous_text": True,
+        "whisper_condition_on_previous_text": False,  # was True — this feeds each new segment's decoding the *previous* segment's text, which biases it toward continuing whatever pattern it just produced. Once it hallucinates "Thank you." once, this makes it more likely to keep producing outro-style filler on the next ambiguous/quiet segment too. Off by default now; turn on if you specifically want better cross-segment context for long continuous speech and hallucinations aren't a problem for your setup.
         "whisper_temperature_increment_on_fallback": 0.2,
         "whisper_no_speech_threshold": 0.6,
         "whisper_logprob_threshold": -1.0,
         "whisper_compression_ratio_threshold": 2.4,
+        # Advanced/developer overrides for a non-OpenAI-compatible Whisper
+        # server — blank means "use the auto-derived /audio/transcriptions
+        # path and standard verbose_json response parsing", same pattern as
+        # the AI-translation overrides. See AI_TRANSLATION.md.
+        "whisper_endpoint_url": "",
+        "whisper_response_text_path": "",
         "whisper_translate_temperature": 0.0,
         "whisper_translate_best_of": 5,
         "whisper_translate_beam_size": 5,
@@ -489,11 +500,13 @@ class VoiceTranslatorApp:
         "whisper_translate_length_penalty": 1.0,
         "whisper_translate_suppress_tokens": "-1",
         "whisper_translate_initial_prompt": "",
-        "whisper_translate_condition_on_previous_text": True,
+        "whisper_translate_condition_on_previous_text": False,  # see whisper_condition_on_previous_text above — same hallucination-loop concern applies here
         "whisper_translate_temperature_increment_on_fallback": 0.2,
         "whisper_translate_no_speech_threshold": 0.6,
         "whisper_translate_logprob_threshold": -1.0,
         "whisper_translate_compression_ratio_threshold": 2.4,
+        "whisper_translate_endpoint_url": "",
+        "whisper_translate_response_text_path": "",
         # VAD — threshold + end-of-speech delay are both hot-reloadable
         "vad_threshold": -30.0,  # dB — the slider value is now in dB directly
         "vad_end_silence_ms": 300,  # ms of silence before dispatching (Whisper/Moonshine) — was 80ms, too short: natural mid-sentence pauses (breathing, thinking) routinely exceed that, so Whisper got flooded with tiny fragmented clips, which is exactly when it hallucinates fillers like "thank you"
@@ -894,6 +907,8 @@ class VoiceTranslatorApp:
                     compression_ratio_threshold=self.settings[
                         "whisper_compression_ratio_threshold"
                     ],
+                    endpoint_url=self.settings.get("whisper_endpoint_url"),
+                    response_text_path=self.settings.get("whisper_response_text_path"),
                 )
                 self.recognizer = None
                 self.model = None
@@ -1119,6 +1134,10 @@ class VoiceTranslatorApp:
                     compression_ratio_threshold=self.settings[
                         "whisper_translate_compression_ratio_threshold"
                     ],
+                    endpoint_url=self.settings.get("whisper_translate_endpoint_url"),
+                    response_text_path=self.settings.get(
+                        "whisper_translate_response_text_path"
+                    ),
                 )
                 return wt.translate(self.last_audio_chunk)
             elif mode == "argos" and self.argos_translator:
@@ -1546,6 +1565,11 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 session_info = gr.Markdown("### Session initializing...")
                 gr.Markdown("# 🎤 Voice Translator")
                 browser_session_data = gr.HTML(visible=True)
+                # Hidden: populated client-side (window.location / sessionStorage
+                # — genuinely per-tab, unlike cookies) before handle_ui_load runs.
+                # See the JS in the interface.load() chain near the bottom of
+                # this function, and session.py's module docstring for why.
+                slug_state = gr.Textbox(visible=False, elem_id="slug-state")
             with gr.Column(scale=1):
                 with gr.Group():
                     gr.Markdown(
@@ -1571,8 +1595,13 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                         value=None,
                         interactive=True,
                         scale=4,
+                        info="Select a session, then Close it — selecting alone no "
+                        "longer closes anything.",
                     )
                     refresh_sessions_btn = gr.Button("🔄 Refresh", size="sm", scale=1)
+                    close_session_btn = gr.Button(
+                        "🗑️ Close Selected Session", size="sm", variant="stop"
+                    )
 
         with gr.Row():
             # ── Left column: settings ─────────────────────────────────────────
@@ -1654,7 +1683,12 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                                 label="Initial prompt", placeholder="Optional"
                             )
                             whisper_condition_on_previous_text = gr.Checkbox(
-                                value=True, label="Condition on previous text"
+                                value=False,
+                                label="Condition on previous text",
+                                info="Off by default — biases decoding toward whatever "
+                                "the previous segment said, which can amplify hallucination "
+                                "loops (once it says 'Thank you.' once, it's more likely to "
+                                "keep saying outro-style filler on the next quiet segment).",
                             )
                             whisper_temperature_increment_on_fallback = gr.Slider(
                                 0.0,
@@ -1676,6 +1710,32 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                                 step=0.1,
                                 label="Compression ratio threshold",
                             )
+                            with gr.Accordion(
+                                "🛠️ Advanced: custom endpoint & response shape (developer)",
+                                open=False,
+                            ):
+                                gr.Markdown(
+                                    "For a Whisper-compatible server that isn't shaped "
+                                    "like OpenAI's API. Leave blank to use the default: "
+                                    "`{API Host}/audio/transcriptions` and standard "
+                                    "verbose_json response parsing. See AI_TRANSLATION.md."
+                                )
+                                whisper_endpoint_url = gr.Textbox(
+                                    label="Full endpoint URL override",
+                                    placeholder="e.g. https://api.example.com/v1/transcribe",
+                                    info="Used exactly as-is instead of deriving from "
+                                    "API Host + /audio/transcriptions.",
+                                )
+                                whisper_response_text_path = gr.Textbox(
+                                    label="Response text path",
+                                    placeholder="e.g. result.text (default: standard "
+                                    "verbose_json segments — see AI_TRANSLATION.md)",
+                                    info="Dot-path to the transcribed text in a "
+                                    "non-standard JSON response. When set, this bypasses "
+                                    "the no_speech/logprob/compression_ratio filtering "
+                                    "above entirely, since a custom shape can't be "
+                                    "assumed to have that segment data.",
+                                )
                         test_whisper_btn = gr.Button("🔍 Test Connection", size="sm")
 
                     with gr.Group(visible=False) as moonshine_settings:
@@ -1977,7 +2037,10 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                                     label="Initial prompt", placeholder="Optional"
                                 )
                                 whisper_trans_condition_on_previous_text = gr.Checkbox(
-                                    value=True, label="Condition on previous text"
+                                    value=False,
+                                    label="Condition on previous text",
+                                    info="Off by default — see the same setting in "
+                                    "Whisper recognition above for why.",
                                 )
                                 whisper_trans_temperature_increment_on_fallback = (
                                     gr.Slider(
@@ -2001,6 +2064,23 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                                     step=0.1,
                                     label="Compression ratio threshold",
                                 )
+                                with gr.Accordion(
+                                    "🛠️ Advanced: custom endpoint & response shape "
+                                    "(developer)",
+                                    open=False,
+                                ):
+                                    whisper_trans_endpoint_url = gr.Textbox(
+                                        label="Full endpoint URL override",
+                                        placeholder="e.g. https://api.example.com/v1/translate",
+                                        info="Used exactly as-is instead of deriving "
+                                        "from API Host + /audio/translations.",
+                                    )
+                                    whisper_trans_response_text_path = gr.Textbox(
+                                        label="Response text path",
+                                        placeholder="e.g. result.text",
+                                        info="Same idea as the recognition-side setting "
+                                        "— see AI_TRANSLATION.md.",
+                                    )
                             gr.Markdown(
                                 "*Translates audio directly to English using Whisper*"
                             )
@@ -2424,8 +2504,16 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             app = SESSION_APPS.get(slug)
             if app:
                 app.touch()
+            # Bound the session_hash -> slug registry to currently-open tabs.
+            forget_session_hash(request.session_hash)
 
-        def handle_ui_load(request: gr.Request):
+        def handle_ui_load(js_slug, request: gr.Request):
+            # js_slug came from window.location/sessionStorage in the browser
+            # (see the JS below) — genuinely scoped to this one tab, unlike a
+            # cookie. Register it against this tab's stable session_hash so
+            # every *other* handler's plain get_slug(request) call resolves
+            # to the same, correct slug for the rest of this tab's life.
+            register_slug(request.session_hash, js_slug)
             slug = get_slug(request)
             app = get_or_create_app(slug)
 
@@ -2488,6 +2576,8 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 whisper_compression_ratio_threshold: s[
                     "whisper_compression_ratio_threshold"
                 ],
+                whisper_endpoint_url: s["whisper_endpoint_url"],
+                whisper_response_text_path: s["whisper_response_text_path"],
                 whisper_trans_host: s["whisper_translate_host"],
                 whisper_trans_api_key: s["whisper_translate_api_key"],
                 whisper_trans_model: s["whisper_translate_model"],
@@ -2512,6 +2602,10 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 ],
                 whisper_trans_compression_ratio_threshold: s[
                     "whisper_translate_compression_ratio_threshold"
+                ],
+                whisper_trans_endpoint_url: s["whisper_translate_endpoint_url"],
+                whisper_trans_response_text_path: s[
+                    "whisper_translate_response_text_path"
                 ],
                 argos_source: s["argos_source_lang"],
                 argos_target: s["argos_target_lang"],
@@ -2594,6 +2688,8 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 whisper_compression_ratio_threshold: s[
                     "whisper_compression_ratio_threshold"
                 ],
+                whisper_endpoint_url: s["whisper_endpoint_url"],
+                whisper_response_text_path: s["whisper_response_text_path"],
                 whisper_trans_host: s["whisper_translate_host"],
                 whisper_trans_api_key: s["whisper_translate_api_key"],
                 whisper_trans_model: s["whisper_translate_model"],
@@ -2618,6 +2714,10 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 ],
                 whisper_trans_compression_ratio_threshold: s[
                     "whisper_translate_compression_ratio_threshold"
+                ],
+                whisper_trans_endpoint_url: s["whisper_translate_endpoint_url"],
+                whisper_trans_response_text_path: s[
+                    "whisper_translate_response_text_path"
                 ],
                 argos_source: s["argos_source_lang"],
                 argos_target: s["argos_target_lang"],
@@ -2755,6 +2855,12 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
             _set("whisper_compression_ratio_threshold"),
             [whisper_compression_ratio_threshold],
         )
+        whisper_endpoint_url.change(
+            _set("whisper_endpoint_url"), [whisper_endpoint_url]
+        )
+        whisper_response_text_path.change(
+            _set("whisper_response_text_path"), [whisper_response_text_path]
+        )
 
         # Whisper translate
         whisper_trans_host.change(_set("whisper_translate_host"), [whisper_trans_host])
@@ -2804,6 +2910,13 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         whisper_trans_compression_ratio_threshold.change(
             _set("whisper_translate_compression_ratio_threshold"),
             [whisper_trans_compression_ratio_threshold],
+        )
+        whisper_trans_endpoint_url.change(
+            _set("whisper_translate_endpoint_url"), [whisper_trans_endpoint_url]
+        )
+        whisper_trans_response_text_path.change(
+            _set("whisper_translate_response_text_path"),
+            [whisper_trans_response_text_path],
         )
 
         # Display style
@@ -2918,7 +3031,12 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         refresh_sessions_btn.click(
             refresh_sessions_list, outputs=[session_dropdown, session_info]
         )
-        session_dropdown.change(
+        # Selecting a session in the dropdown used to close it immediately on
+        # .change() — surprising ("I cannot close the session" reports were
+        # actually the opposite: it was closing on mere selection, before
+        # anyone meant to confirm that). Now selection just selects; this
+        # button is the actual close action.
+        close_session_btn.click(
             close_session_action, [session_dropdown], [status_text, session_info]
         ).then(refresh_sessions_list, outputs=[session_dropdown, session_info])
 
@@ -2988,6 +3106,8 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 whisper_no_speech_threshold,
                 whisper_logprob_threshold,
                 whisper_compression_ratio_threshold,
+                whisper_endpoint_url,
+                whisper_response_text_path,
                 whisper_trans_host,
                 whisper_trans_api_key,
                 whisper_trans_model,
@@ -3003,6 +3123,8 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 whisper_trans_no_speech_threshold,
                 whisper_trans_logprob_threshold,
                 whisper_trans_compression_ratio_threshold,
+                whisper_trans_endpoint_url,
+                whisper_trans_response_text_path,
                 argos_source,
                 argos_target,
                 fade_timeout,
@@ -3037,9 +3159,36 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
         gr.Timer(1.0).tick(update_logs, outputs=[log_output])
 
         interface.unload(cleanup_user_data)
+
+        # Resolves this tab's slug purely client-side (query string, or a
+        # value persisted in sessionStorage — which, unlike cookies/
+        # localStorage, is genuinely scoped to one tab) before handle_ui_load
+        # runs. See session.py's module docstring for why this replaced the
+        # old cookie-based approach.
+        _RESOLVE_SLUG_JS = """
+        () => {
+            const params = new URLSearchParams(window.location.search);
+            let slug = params.get('session');
+            if (!slug) {
+                slug = sessionStorage.getItem('vt_slug');
+            }
+            if (!slug) {
+                slug = 'main';
+            }
+            slug = slug.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64) || 'main';
+            sessionStorage.setItem('vt_slug', slug);
+            return [slug];
+        }
+        """
+
         interface.load(
-            handle_ui_load,
+            fn=None,
             inputs=None,
+            outputs=[slug_state],
+            js=_RESOLVE_SLUG_JS,
+        ).then(
+            handle_ui_load,
+            inputs=[slug_state],
             outputs=[
                 session_info,
                 popout_url,
@@ -3076,6 +3225,8 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 whisper_no_speech_threshold,
                 whisper_logprob_threshold,
                 whisper_compression_ratio_threshold,
+                whisper_endpoint_url,
+                whisper_response_text_path,
                 whisper_trans_host,
                 whisper_trans_api_key,
                 whisper_trans_model,
@@ -3091,6 +3242,8 @@ def create_ui(args):  # noqa: C901  (complex but intentional)
                 whisper_trans_no_speech_threshold,
                 whisper_trans_logprob_threshold,
                 whisper_trans_compression_ratio_threshold,
+                whisper_trans_endpoint_url,
+                whisper_trans_response_text_path,
                 argos_source,
                 argos_target,
                 fade_timeout,

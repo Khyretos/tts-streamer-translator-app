@@ -39,7 +39,7 @@ _MIN_SPCH = 3  # frames to confirm speech (~30 ms)
 # Minimum speech segment to dispatch to Whisper/Moonshine.
 # Segments shorter than this are almost always desk taps / breath / noise.
 # 500 ms = 50 frames.  Vosk is not affected (it handles segmentation itself).
-_MIN_DISPATCH_MS = 150
+_MIN_DISPATCH_MS = 300  # was 150 — too short a floor let brief noise blips (coughs, clicks, breaths) through to Whisper, which is exactly the kind of ambiguous short clip it hallucinates fillers on
 _MIN_DISPATCH_FRAMES = _MIN_DISPATCH_MS // _F_MS  # 15
 # End-of-speech silence (default 300 ms = 30 frames).
 # ┌─ Whisper/Moonshine users: raise this if phrases are cut off mid-sentence.

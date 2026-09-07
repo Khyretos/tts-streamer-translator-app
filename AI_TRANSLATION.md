@@ -1,6 +1,14 @@
-# AI translation: prompts, endpoints, and request/response shape (Phase 6)
+# Editable prompts, endpoints, and request/response shapes
 
-## Two real bugs found and fixed along the way
+There are two independent places in this app that call an external
+API-compatible service and previously assumed it was shaped exactly like
+OpenAI's: **AI translation** (a chat-completion call) and **Whisper
+recognition/translation** (an audio-transcription call). Both are covered
+below — each with its own settings, but the same underlying idea: leave
+everything blank and you get sensible OpenAI-compatible defaults; override
+whatever you need for a server that isn't shaped that way.
+
+## AI translation: two real bugs found and fixed along the way
 
 1. **The default AI Host was broken out of the box.** `DEFAULT_SETTINGS["ai_host"]`
    was `""` (empty). With no override configured, the endpoint-guessing logic
@@ -18,6 +26,7 @@
    relying on the auto-guess (rather than a host string that already
    happened to include the full working path) was silently 404ing. Fixed to
    `/v1`.
+
 
 ## Editable prompt
 
@@ -78,6 +87,34 @@ in each field shows the exact default value being used when left blank, so
 you can see the working baseline before diverging from it.
 
 ---
+
+# Whisper recognition/translation: editable endpoint & response shape
+
+This was originally requested alongside the AI-translation editability
+above, but only the AI-translation side actually got built — Whisper's own
+transcription/translation call (used by the "whisper" recognition engine
+and the "Whisper Translate" translation mode) was still hardcoded to
+`{host}/audio/transcriptions` / `{host}/audio/translations` with no
+override, and to OpenAI's `verbose_json` segment response shape. Fixed:
+
+- **`whisper_endpoint_url`** (recognition) / **`whisper_translate_endpoint_url`**
+  (translate mode) — if set, used exactly as-is as the full POST URL,
+  instead of deriving `{API Host}/audio/transcriptions` or
+  `{API Host}/audio/translations`.
+- **`whisper_response_text_path`** / **`whisper_translate_response_text_path`**
+  — a dot-path (same syntax as `ai_response_text_path` above, e.g.
+  `result.text` or `alternatives.0.transcript`) into a non-standard JSON
+  response. When set, this **bypasses the no_speech/logprob/
+  compression_ratio confidence filtering** from RECOGNITION_QUALITY.md
+  entirely, since a custom response shape can't be assumed to carry
+  OpenAI's `segments[]` confidence data at all. If the custom path doesn't
+  resolve, it logs a warning and falls back to the standard verbose_json
+  parsing.
+
+Both live in a "🛠️ Advanced: custom endpoint & response shape (developer)"
+accordion inside the existing Advanced Whisper Parameters sections, one for
+recognition and one for Whisper Translate — independent overrides, since
+you might point recognition at one server and translation at another.
 
 # Vosk model sharing across sessions
 

@@ -20,26 +20,74 @@ but it meant:
 
 ## What it does now
 
-Every request is resolved to a persistent **slug** — a stable session
-identity — by `SessionSlugMiddleware`:
+Each browser tab's slug is resolved **client-side**, once, at page load —
+by JavaScript reading the `?session=` query string, or (if absent)
+`sessionStorage` (a value it stores itself, purely to survive a reload of
+*that specific tab* — unlike cookies or `localStorage`, `sessionStorage` is
+genuinely scoped to one tab, never shared with any other tab in the same
+browser), falling back to `DEFAULT_SLUG` (`"main"`) for a completely fresh
+visit. That value gets registered against Gradio's own `request.session_hash`
+— which is already stable for the lifetime of one tab's connection, since
+that's literally how Gradio itself routes queue events back to the right
+client — and every other event handler in that tab looks the slug up from
+that registration for the rest of the tab's life. See `session.py`'s module
+docstring for the full mechanism.
 
-1. `?session=<name>` query parameter, if present.
-2. The first path segment of the URL, if not one of Gradio's own reserved
-   paths (`config`, `assets`, `ws`, `popout`, etc.) — see
-   `RESERVED_PATH_SEGMENTS` in `voice_translator.py`.
-3. An existing `vt_slug` cookie.
-4. A freshly generated random slug (first-ever visit with no name given —
-   still stable across reloads via the cookie, just unnamed).
+### Bug: sessions bleeding into each other across tabs (cookie-based design)
 
-The resolved slug is pinned to the browser as a 1-year cookie, so it's
-recovered on *every* subsequent request/event call automatically — this is
-what makes it reliable, since query strings are **not** forwarded by the
-browser to Gradio's internal queue/WebSocket calls, but cookies are.
+An earlier version of this resolved the slug server-side using a cookie.
+That's broken for the actual use case: **cookies are shared across every
+tab of the same browser**, not scoped to one tab. Opening `khyretos` in one
+tab and `discord` in another meant whichever tab loaded most recently
+overwrote the one shared cookie for the *entire browser* — so both tabs'
+subsequent clicks (Start, Stop, settings changes — none of which carry the
+original page's query string on their own; that's a real Gradio queue
+limitation, not something fixable at the app layer) silently resolved to
+whichever slug's cookie happened to be current at that moment. Symptoms:
+"Already running — press Stop first" when starting a *different* session
+that was never actually started, the session title in one tab suddenly
+showing another tab's name, and closing a session from the "Manage
+Sessions" dropdown not doing anything (because `current` was resolving to
+the wrong tab's identity, throwing off which entries got excluded/matched).
+
+Fixed by moving off cookies entirely, to the `sessionStorage` + `session_hash`
+registry design described above — genuinely per-tab by construction, so two
+tabs with two different session names can never leak into each other again.
+
+### Bug: `Session: gradio_api`
+
+If you saw a session literally named `gradio_api` on first load, that was a
+real bug, now fixed. Modern Gradio (5.x/6.x) namespaces essentially all of
+its internal traffic — the queue, config, file serving, MCP, etc. — under a
+single `/gradio_api/...` path prefix. `RESERVED_PATH_SEGMENTS` was built
+assuming older Gradio's bare top-level paths (`/queue`, `/config`,
+`/file=...`) and didn't know about this prefix, so some internal Gradio
+request to a path like `/gradio_api/queue/join` got its first path segment
+("gradio_api") treated as if it were a user-chosen slug. Fixed by adding
+`"gradio_api"` to the reserved list; the cookie-poisoning consequence this
+originally had is moot now that slugs aren't cookie-based at all.
+
+### Opening / creating a session from the UI
+
+There's a "session switcher" in the header: a name field + **Go**
+button (navigates to `?session=<name>`, sanitized client-side and again on
+the server) and a **New** button (jumps to a fresh randomly-named session).
+Previously the only way to open a named session was to already know you
+could edit the URL by hand.
+
+The resolved slug is stored in that tab's `sessionStorage`, so it survives
+a reload of *that tab* without needing to retype the URL — this is also
+what makes multi-tab correct: `sessionStorage` is never shared with other
+tabs, unlike a cookie.
 
 Each slug maps to exactly one `VoiceTranslatorApp` and one settings file
-(`settings/<slug>.json`). Opening the same URL in a new tab, after a reload,
-or from a different device re-attaches to the *same* running session —
-same settings, same in-progress recognition — instead of creating a new one.
+(`settings/<slug>.json`). Opening the same URL in a new tab (or the same
+tab, after a reload) re-attaches to the *same* running session — same
+settings, same in-progress recognition — instead of creating a new one.
+Opening it from an entirely different browser/device also re-attaches to
+the same session (settings are looked up by slug, not tied to any one
+browser) — it just won't share that other browser's `sessionStorage`
+convenience, so you'd need to include `?session=<name>` in the URL there.
 
 A tab closing/reloading no longer destroys anything. Sessions are permanent
 by design: nothing in this app ever automatically stops or tears down a
@@ -77,7 +125,7 @@ only things that stop a session:
   ```
 
   Keep this list in sync with `RESERVED_PATH_SEGMENTS` in
-  `voice_translator.py` if you ever change it.
+  `session.py` if you ever change it.
 
 ## Migration
 
