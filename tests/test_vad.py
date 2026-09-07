@@ -42,8 +42,9 @@ class TestProcessChunk:
 
     def test_loud_tone_eventually_dispatches_a_segment(self):
         vad = FastVAD(threshold_db=-40.0, end_silence_ms=50)
-        # Speech, then enough silence frames to close the segment.
-        segments = vad.process_chunk(tone_bytes(20))
+        # Speech (350ms, comfortably over the 300ms minimum dispatch floor),
+        # then enough silence frames to close the segment.
+        segments = vad.process_chunk(tone_bytes(35))
         segments += vad.process_chunk(silence_bytes(20))
         assert len(segments) == 1
         # Segment bytes should be non-trivial in length.
